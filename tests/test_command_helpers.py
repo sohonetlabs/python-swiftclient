@@ -22,7 +22,7 @@ from six import StringIO
 import testtools
 
 from swiftclient import command_helpers as h
-from swiftclient.multithreading import MultiThreadingManager
+from swiftclient.multithreading import OutputManager
 
 
 class TestStatHelpers(testtools.TestCase):
@@ -34,10 +34,10 @@ class TestStatHelpers(testtools.TestCase):
             'token': 'tk12345',
         }
         self.conn = mock.MagicMock(**conn_attrs)
-        self.options = mock.MagicMock(human=False, verbose=1)
+        self.options = {'human': False, 'verbose': 1}
         self.stdout = StringIO()
         self.stderr = StringIO()
-        self.thread_manager = MultiThreadingManager(self.stdout, self.stderr)
+        self.output_manager = OutputManager(self.stdout, self.stderr)
 
     def assertOut(self, expected):
         real = self.stdout.getvalue()
@@ -57,7 +57,7 @@ class TestStatHelpers(testtools.TestCase):
             raise
 
     def test_stat_account_human(self):
-        self.options.human = True
+        self.options['human'] = True
         # stub head_account
         stub_headers = {
             'x-account-container-count': 42,
@@ -66,8 +66,10 @@ class TestStatHelpers(testtools.TestCase):
         }
         self.conn.head_account.return_value = stub_headers
 
-        with self.thread_manager as thread_manager:
-            h.stat_account(self.conn, self.options, thread_manager)
+        with self.output_manager as output_manager:
+            items, headers = h.stat_account(self.conn, self.options)
+            output_manager.print_items(items)
+            h.print_account_headers(headers, output_manager)
         expected = """
        Account: a
     Containers: 42
@@ -77,7 +79,7 @@ class TestStatHelpers(testtools.TestCase):
         self.assertOut(expected)
 
     def test_stat_account_verbose(self):
-        self.options.verbose += 1
+        self.options['verbose'] += 1
         # stub head_account
         stub_headers = {
             'x-account-container-count': 42,
@@ -86,8 +88,10 @@ class TestStatHelpers(testtools.TestCase):
         }
         self.conn.head_account.return_value = stub_headers
 
-        with self.thread_manager as thread_manager:
-            h.stat_account(self.conn, self.options, thread_manager)
+        with self.output_manager as output_manager:
+            items, headers = h.stat_account(self.conn, self.options)
+            output_manager.print_items(items)
+            h.print_account_headers(headers, output_manager)
         expected = """
     StorageURL: http://storage/v1/a
     Auth Token: tk12345
@@ -99,7 +103,7 @@ class TestStatHelpers(testtools.TestCase):
         self.assertOut(expected)
 
     def test_stat_container_human(self):
-        self.options.human = True
+        self.options['human'] = True
         # stub head container request
         stub_headers = {
             'x-container-object-count': 10 ** 6,
@@ -107,8 +111,10 @@ class TestStatHelpers(testtools.TestCase):
         }
         self.conn.head_container.return_value = stub_headers
         args = ('c',)
-        with self.thread_manager as thread_manager:
-            h.stat_container(self.conn, self.options, args, thread_manager)
+        with self.output_manager as output_manager:
+            items, headers = h.stat_container(self.conn, self.options, *args)
+            output_manager.print_items(items)
+            h.print_container_headers(headers, output_manager)
         expected = """
        Account: a
      Container: c
@@ -122,7 +128,7 @@ class TestStatHelpers(testtools.TestCase):
         self.assertOut(expected)
 
     def test_stat_container_verbose(self):
-        self.options.verbose += 1
+        self.options['verbose'] += 1
         # stub head container request
         stub_headers = {
             'x-container-object-count': 10 ** 6,
@@ -130,8 +136,10 @@ class TestStatHelpers(testtools.TestCase):
         }
         self.conn.head_container.return_value = stub_headers
         args = ('c',)
-        with self.thread_manager as thread_manager:
-            h.stat_container(self.conn, self.options, args, thread_manager)
+        with self.output_manager as output_manager:
+            items, headers = h.stat_container(self.conn, self.options, *args)
+            output_manager.print_items(items)
+            h.print_container_headers(headers, output_manager)
         expected = """
            URL: http://storage/v1/a/c
     Auth Token: tk12345
@@ -147,7 +155,7 @@ class TestStatHelpers(testtools.TestCase):
         self.assertOut(expected)
 
     def test_stat_object_human(self):
-        self.options.human = True
+        self.options['human'] = True
         # stub head object request
         stub_headers = {
             'content-length': 2 ** 20,
@@ -157,8 +165,10 @@ class TestStatHelpers(testtools.TestCase):
         }
         self.conn.head_object.return_value = stub_headers
         args = ('c', 'o')
-        with self.thread_manager as thread_manager:
-            h.stat_object(self.conn, self.options, args, thread_manager)
+        with self.output_manager as output_manager:
+            items, headers = h.stat_object(self.conn, self.options, *args)
+            output_manager.print_items(items, skip_missing=True)
+            h.print_object_headers(headers, output_manager)
         expected = """
        Account: a
      Container: c
@@ -171,7 +181,7 @@ Content-Encoding: gzip
         self.assertOut(expected)
 
     def test_stat_object_verbose(self):
-        self.options.verbose += 1
+        self.options['verbose'] += 1
         # stub head object request
         stub_headers = {
             'content-length': 2 ** 20,
@@ -181,8 +191,10 @@ Content-Encoding: gzip
         }
         self.conn.head_object.return_value = stub_headers
         args = ('c', 'o')
-        with self.thread_manager as thread_manager:
-            h.stat_object(self.conn, self.options, args, thread_manager)
+        with self.output_manager as output_manager:
+            items, headers = h.stat_object(self.conn, self.options, *args)
+            output_manager.print_items(items, skip_missing=True)
+            h.print_object_headers(headers, output_manager)
         expected = """
            URL: http://storage/v1/a/c/o
     Auth Token: tk12345
