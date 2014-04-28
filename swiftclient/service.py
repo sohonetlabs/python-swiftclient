@@ -17,7 +17,7 @@ from cStringIO import StringIO
 from errno import EEXIST, ENOENT
 from hashlib import md5
 from os import environ, makedirs, utime
-from os.path import dirname, getmtime, getsize, isdir, join, \
+from os.path import dirname, exists, getmtime, getsize, isdir, join, \
     sep as os_path_sep
 from random import shuffle
 from Queue import Queue
@@ -125,6 +125,7 @@ _default_local_options = {
     'leave_segments': False,
     'changed': None,
     'skip_identical': False,
+    'no_clobber': False,
     'yes_all': False,
     'read_acl': None,
     'write_acl': None,
@@ -581,8 +582,24 @@ class SwiftService(object):
 
         path = join(container, obj) if options['yes_all'] else obj
         path = path.lstrip(os_path_sep)
+        filename = out_file if out_file else path
+
+        if options['no_clobber']:
+            if exists(filename):
+                # Skip downloading the object
+                _res = {
+                    'action': 'download_object',
+                    'container': container,
+                    'object': obj,
+                    'success': False,
+                    'error': SwiftError(
+                        "File %s already exists, skipping." % filename,
+                        container=container, obj=obj),
+                    'path': filename,
+                }
+                return _res
+
         if options['skip_identical'] and out_file != '-':
-            filename = out_file if out_file else path
             try:
                 fp = open(filename, 'rb')
             except IOError:
@@ -625,15 +642,14 @@ class SwiftService(object):
 
                         if not options['no_download']:
                             if out_file == "-":
-                                _result = {
+                                _res = {
+                                    'action': 'download_object',
                                     'path': path,
                                     'contents': _obj_body
                                 }
-                                return _result
-                            elif out_file:
-                                fp = open(out_file, 'wb')
+                                return _res
                             else:
-                                fp = open(path, 'wb')
+                                fp = open(filename, 'wb')
 
                             for chunk in _obj_body.buffer():
                                 fp.write(chunk)
@@ -661,7 +677,7 @@ class SwiftService(object):
                 'success': True,
                 'container': container,
                 'object': obj,
-                'path': path,
+                'path': filename,
                 'start_time': start_time,
                 'finish_time': finish_time,
                 'headers_receipt': headers_receipt,
@@ -679,7 +695,7 @@ class SwiftService(object):
                 'success': False,
                 'error': err,
                 'response_dict': _results_dict,
-                'path': path,
+                'path': filename,
                 'attempts': conn.attempts
             }
             return _res
@@ -891,9 +907,18 @@ class SwiftService(object):
             put_headers = {'x-object-meta-mtime': "%f" % getmtime(path)}
         else:
             put_headers = {'x-object-meta-mtime': "%f" % round(time())}
-        if options['changed']:
+        if options['changed'] or options['no_clobber']:
             try:
                 headers = conn.head_object(container, obj)
+                # If the head succeeds then the object already exists
+                # and the no_clobber option should immediately return
+                if options['no_clobber']:
+                    _res.update({
+                        'success': False,
+                        'error': SwiftError(
+                            "Object %s already exists, skipping upload." % obj,
+                            container=container, obj=obj)})
+                    return _res
                 ct = headers.get('content-type')
                 cl = int(headers.get('content-length'))
                 et = headers.get('etag')
@@ -1007,7 +1032,7 @@ class SwiftService(object):
             old_slo_manifest_paths = []
             new_slo_manifest_paths = set()
             if options['changed'] or options['skip_identical'] \
-                    or not options['leave_segments']:
+                    or options['no_clobber'] or not options['leave_segments']:
                 checksum = None
                 if options['skip_identical']:
                     try:
@@ -1025,6 +1050,16 @@ class SwiftService(object):
                         checksum = md5sum.hexdigest()
                 try:
                     headers = conn.head_object(container, obj)
+                    # If the head succeeds then the object already exists
+                    # and the no_clobber option should immediately return
+                    if options['no_clobber']:
+                        _res.update({
+                            'success': False,
+                            'error': SwiftError(
+                                "Object %s already exists, "
+                                    "skipping upload." % obj,
+                                container=container, obj=obj)})
+                        return _res
                     if options['skip_identical'] and checksum is not None:
                         if checksum == headers.get('etag'):
                             _res.update({

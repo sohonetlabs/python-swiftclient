@@ -187,6 +187,7 @@ Optional arguments:
                         Example --header "content-type:text/plain"
   --skip-identical      Skip downloading files that are identical on both
                         sides.
+  --no-clobber          Skip downloading files that already exist.
 '''.strip("\n")
 
 
@@ -228,6 +229,9 @@ def st_download(parser, args, output_manager):
         '--skip-identical', action='store_true', dest='skip_identical',
         default=False, help='Skip downloading files that are identical on '
         'both sides.')
+    parser.add_option(
+        '--no-clobber', action='store_true', dest='no_clobber', default=False,
+        help='Skip downloading files that already exist.')
     (options, args) = parse_args(parser, args)
     args = args[1:]
     if options.out_file == '-':
@@ -640,6 +644,7 @@ Optional arguments:
                         Upload file and name object to <object-name> or upload
                         dir and use <object-name> as object prefix instead of
                         folder name.
+  --no-clobber          Skip uploading files that already exist.
 '''.strip('\n')
 
 
@@ -690,6 +695,9 @@ def st_upload(parser, args, output_manager):
         '', '--object-name', dest='object_name',
         help='Upload file and name object to <object-name> or upload dir and '
         'use <object-name> as object prefix instead of folder name.')
+    parser.add_option(
+        '--no-clobber', action='store_true', dest='no_clobber', default=False,
+        help='Skip uploading files that already exist.')
     (options, args) = parse_args(parser, args)
     args = args[1:]
     if len(args) < 2:
