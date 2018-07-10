@@ -42,7 +42,7 @@ class TestFunctional(unittest.TestCase):
     def _get_config(self):
         config_file = os.environ.get('SWIFT_TEST_CONFIG_FILE',
                                      '/etc/swift/test.conf')
-        config = configparser.SafeConfigParser({'auth_version': '1'})
+        config = configparser.ConfigParser({'auth_version': '1'})
         config.read(config_file)
         self.config = config
         if config.has_section('func_test'):
@@ -110,15 +110,20 @@ class TestFunctional(unittest.TestCase):
                 pass
 
     def _check_account_headers(self, headers):
-        self.assertTrue(headers.get('content-length'))
-        self.assertTrue(headers.get('x-account-object-count'))
-        self.assertTrue(headers.get('x-timestamp'))
-        self.assertTrue(headers.get('x-trans-id'))
-        self.assertTrue(headers.get('date'))
-        self.assertTrue(headers.get('x-account-bytes-used'))
-        self.assertTrue(headers.get('x-account-container-count'))
-        self.assertTrue(headers.get('content-type'))
-        self.assertTrue(headers.get('accept-ranges'))
+        headers_to_check = [
+            'content-length',
+            'x-account-object-count',
+            'x-timestamp',
+            'x-trans-id',
+            'date',
+            'x-account-bytes-used',
+            'x-account-container-count',
+            'content-type',
+            'accept-ranges',
+        ]
+        for h in headers_to_check:
+            self.assertIn(h, headers)
+            self.assertTrue(headers[h])
 
     def test_stat_account(self):
         headers = self.conn.head_account()
@@ -322,16 +327,16 @@ class TestFunctional(unittest.TestCase):
         # verify that put using a generator yielding empty strings does not
         # cause connection to be closed
         def data():
-            yield "should"
-            yield ""
-            yield " tolerate"
-            yield ""
-            yield " empty chunks"
+            yield b"should"
+            yield b""
+            yield b" tolerate"
+            yield b""
+            yield b" empty chunks"
 
         self.conn.put_object(
             self.containername, self.objectname, data())
         hdrs, body = self.conn.get_object(self.containername, self.objectname)
-        self.assertEqual("should tolerate empty chunks", body)
+        self.assertEqual(b"should tolerate empty chunks", body)
 
     def test_download_object_retry_chunked(self):
         resp_chunk_size = 2
@@ -400,10 +405,59 @@ class TestFunctional(unittest.TestCase):
     def test_post_object(self):
         self.conn.post_object(self.containername,
                               self.objectname,
-                              {'x-object-meta-color': 'Something'})
+                              {'x-object-meta-color': 'Something',
+                               'x-object-meta-uni': b'\xd8\xaa'.decode('utf8'),
+                               'x-object-meta-int': 123,
+                               'x-object-meta-float': 45.67,
+                               'x-object-meta-bool': False})
 
         headers = self.conn.head_object(self.containername, self.objectname)
         self.assertEqual('Something', headers.get('x-object-meta-color'))
+        self.assertEqual(b'\xd8\xaa'.decode('utf-8'),
+                         headers.get('x-object-meta-uni'))
+        self.assertEqual('123', headers.get('x-object-meta-int'))
+        self.assertEqual('45.67', headers.get('x-object-meta-float'))
+        self.assertEqual('False', headers.get('x-object-meta-bool'))
+
+    def test_copy_object(self):
+        self.conn.put_object(
+            self.containername, self.objectname, self.test_data)
+        self.conn.copy_object(self.containername,
+                              self.objectname,
+                              headers={'x-object-meta-color': 'Something'})
+
+        headers = self.conn.head_object(self.containername, self.objectname)
+        self.assertEqual('Something', headers.get('x-object-meta-color'))
+
+        self.conn.copy_object(self.containername,
+                              self.objectname,
+                              headers={'x-object-meta-taste': 'Second'})
+
+        headers = self.conn.head_object(self.containername, self.objectname)
+        self.assertEqual('Something', headers.get('x-object-meta-color'))
+        self.assertEqual('Second', headers.get('x-object-meta-taste'))
+
+        destination = "/%s/%s" % (self.containername, self.objectname_2)
+        self.conn.copy_object(self.containername,
+                              self.objectname,
+                              destination,
+                              headers={'x-object-meta-taste': 'Second'})
+        headers, data = self.conn.get_object(self.containername,
+                                             self.objectname_2)
+        self.assertEqual(self.test_data, data)
+        self.assertEqual('Something', headers.get('x-object-meta-color'))
+        self.assertEqual('Second', headers.get('x-object-meta-taste'))
+
+        destination = "/%s/%s" % (self.containername, self.objectname_2)
+        self.conn.copy_object(self.containername,
+                              self.objectname,
+                              destination,
+                              headers={'x-object-meta-color': 'Else'},
+                              fresh_metadata=True)
+
+        headers = self.conn.head_object(self.containername, self.objectname_2)
+        self.assertEqual('Else', headers.get('x-object-meta-color'))
+        self.assertIsNone(headers.get('x-object-meta-taste'))
 
     def test_get_capabilities(self):
         resp = self.conn.get_capabilities()
@@ -431,9 +485,6 @@ class TestUsingKeystone(TestFunctional):
             self.auth_url, username, password, auth_version=self.auth_version,
             os_options=os_options)
 
-    def setUp(self):
-        super(TestUsingKeystone, self).setUp()
-
 
 class TestUsingKeystoneV3(TestFunctional):
     """
@@ -460,6 +511,3 @@ class TestUsingKeystoneV3(TestFunctional):
         return swiftclient.Connection(self.auth_url, username, password,
                                       auth_version=self.auth_version,
                                       os_options=os_options)
-
-    def setUp(self):
-        super(TestUsingKeystoneV3, self).setUp()

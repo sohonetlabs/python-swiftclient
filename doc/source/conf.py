@@ -31,8 +31,11 @@ sys.path.insert(0, ROOT)
 
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
-extensions = ['sphinx.ext.autodoc', 'sphinx.ext.doctest', 'sphinx.ext.todo',
-              'sphinx.ext.coverage', 'oslosphinx']
+extensions = ['sphinx.ext.autodoc',
+              'sphinx.ext.doctest',
+              'sphinx.ext.todo',
+              'sphinx.ext.coverage',
+              'openstackdocstheme']
 
 autoclass_content = 'both'
 autodoc_default_flags = ['members', 'undoc-members', 'show-inheritance']
@@ -51,7 +54,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'Swiftclient'
-copyright = u'2013 OpenStack, LLC.'
+copyright = u'2013-2016 OpenStack, LLC.'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -104,12 +107,14 @@ pygments_style = 'sphinx'
 
 # The theme to use for HTML and HTML Help pages.  Major themes that come with
 # Sphinx are currently 'default' and 'sphinxdoc'.
-#html_theme = 'nature'
+html_theme = 'openstackdocs'
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
 # html_theme_options = {}
+
+html_theme_options = {'show_other_versions': True}
 
 # Add any paths that contain custom themes here, relative to this directory.
 # html_theme_path = []

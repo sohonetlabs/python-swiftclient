@@ -1,3 +1,127 @@
+3.5.0
+-----
+
+* Allow for object uploads > 5GB from stdin.
+
+  When uploading from standard input, swiftclient will turn the upload
+  into an SLO in the case of large objects. By default, input larger
+  than 10MB will be uploaded as an SLO with 10MB segment sizes. Users
+  can also supply the ``--segment-size`` option to alter that
+  threshold and the SLO segment size. One segment is buffered in
+  memory (which is why 10MB default was chosen).
+
+* The ``--meta`` option can now be set on the upload command.
+
+* Updated PyPy test dependency references to be more accurate
+  on different distros.
+
+* Various other minor bug fixes and improvements.
+
+3.4.0
+-----
+
+* The `swift` CLI now supports streaming from stdin. If "-" is given
+  as the source, the object content is read from stdin. The
+  `--object-name` must be given when content is loaded from stdin.
+
+* Tolerate RFC-compliant ETags returned from the server.
+
+* Skip checksum validation on partial downloads.
+
+* Buffer reads from disk, resulting in much faster upload throughput.
+
+* Added support for ISO 8601 timestamps for tempurl, matching the
+  feature in Swift 2.13.0.
+
+* Added an option to ignore mtime metadata entry (`--ignore-mtime`).
+
+* When using SwiftService to delete many objects, the bulk delete page
+  size will now be respected. Previously, exceeding this limit would
+  prevent any objects from being deleted.
+
+* Expose `--prefix` as an option for st_delete.
+
+* Imported docs content from openstack-manuals project.
+
+* Various other minor bug fixes and improvements.
+
+3.3.0
+-----
+
+* Added support for prefix-based tempurls. This allows you to create a
+  tempurl that is valid for all objects which share a given prefix and
+  matches the feature in Swift 2.12.0 and later.
+
+* In the SDK, we previously only accepted iterables of strings like
+  'Header: Value'. Now, we'll also accept lists of tuples like
+  ('Header', 'Value') as well as dictionaries like {'Header': 'Value'}.
+
+* Improved help message strings
+
+* Various other minor bug fixes and improvements.
+
+3.2.0
+-----
+
+* Added Keystone session support and a "v1password" plugin for Keystone.
+  This plugin provides a way for Keystone sessions (and clients that
+  use them, like python-openstackclient) to communicate with old auth
+  endpoints that still use this mechanism.
+
+* HEAD, GET, and DELETE now support sending additional headers to match
+  existing functionality on PUT requests.
+
+* Various other minor bug fixes and improvements.
+
+3.1.0
+-----
+
+* Added a copy object method.
+
+* Arbitrary query strings can now be passed into container functions.
+
+* Client certificate and key can now be specified via CLI
+  options (--os-cert/--os-key) or environment variables ($OS_CERT/$OS_KEY).
+
+* A new CLI option `--ignore-checksum` can be specified to turn off
+  checksum validation. In the SDK, the new `checksum=True` parameter can
+  be used for the same purpose.
+
+* Added --json option to `swift capabilities` / `swift info`
+
+* Default to v3 auth if we find a (user|project)-domain-(name|id) option.
+
+* Added a Python version constraint of >= Py27.
+
+* `client.py` will now retry on a 401 (auth error) even if `retries` is
+  set to zero.
+
+* Fixed `swift download` when `marker` was specified.
+
+* Object segments uploaded via swiftclient are now given the content type
+  "application/swiftclient-segment".
+
+* "Directory marker" objects are now given a "application/directory"
+  content type to match both Swift's `staticweb` feature and other
+  ecosystem tools.
+
+* Strip leading/trailing whitespace from headers (otherwise, new versions
+  of the requests library will raise an InvalidHeader error). Additionally,
+  header values with standard types (integer, float, or bool) are coerced
+  to strings before being sent to a socket.
+
+* Non-python dependencies are now specified in bindep.txt. Currently this
+  only lists a single dependency for testing (PyPy), but if future
+  dependencies are added, they will be included in this file.
+
+* Client exceptions now include response headers. One benefit is that
+  this allows clients to see transaction IDs without needing to turn on
+  debug logging.
+
+* Client connections now accept gzip-encoded responses.
+
+* Various other minor bug fixes and improvements.
+
 3.0.0
 -----
 

@@ -207,6 +207,9 @@ Options
         Affects uploads, and allows empty 'pseudofolder' objects to be created
         when the source of an upload is ``None``.
 
+    ``checksum``: ``True``
+        Affects uploads and downloads. If set check md5 sum for the transfer.
+
     ``shuffle``: ``False``
         When downloading objects, the default behaviour of the CLI is to shuffle
         lists of objects in order to spread the load on storage drives when multiple
@@ -216,6 +219,17 @@ Options
         listing. When combined with a single download thread this means that objects
         are downloaded in lexically-sorted order. Setting this option to ``True``
         gives the same shuffling behaviour as the CLI.
+
+    ``destination``: ``None``
+        When copying objects, this specifies the destination where the object
+        will be copied to.  The default of None means copy will be the same as
+        source.
+
+    ``fresh_metadata``: ``None``
+        When copying objects, this specifies that the object metadata on the
+        source will *not* be applied to the destination object - the
+        destination object will have a new fresh set of metadata that includes
+        *only* the metadata specified in the meta option if any at all.
 
 Other available options can be found in ``swiftclient/service.py`` in the
 source code for ``python-swiftclient``. Each ``SwiftService`` method also allows
@@ -298,11 +312,11 @@ method docstring.
 
 Valid calls for this method are as follows:
 
- * ``stat([options])``: Returns stats for the configured account.
- * ``stat(<container>, [options])``: Returns stats for the given container.
- * ``stat(<container>, <object_list>, [options])``: Returns stats for each
-   of the given objects in the the given container (through the returned
-   iterator).
+* ``stat([options])``: Returns stats for the configured account.
+* ``stat(<container>, [options])``: Returns stats for the given container.
+* ``stat(<container>, <object_list>, [options])``: Returns stats for each
+  of the given objects in the given container (through the returned
+  iterator).
 
 Results from stat are dictionaries indicating the success or failure of each
 operation. In the case of a successful stat against an account or container,
@@ -357,15 +371,14 @@ operation was not successful, and will include the keys below:
         'error_timestamp': <timestamp>
     }
 
-Example
-^^^^^^^
+.. topic:: Example
 
-The code below demonstrates the use of ``stat`` to retrieve the headers for a
-given list of objects in a container using 20 threads. The code creates a
-mapping from object name to headers which is then pretty printed to the log.
+   The code below demonstrates the use of ``stat`` to retrieve the headers for
+   a given list of objects in a container using 20 threads. The code creates a
+   mapping from object name to headers which is then pretty printed to the log.
 
-.. literalinclude:: ../../examples/stat.py
-   :language: python
+   .. literalinclude:: ../../examples/stat.py
+      :language: python
 
 List
 ~~~~
@@ -424,14 +437,13 @@ dictionary as described below:
         'error_timestamp': <timestamp>
     }
 
-Example
-^^^^^^^
+.. topic:: Example
 
-The code below demonstrates the use of ``list`` to list all items in a
-container that are over 10MiB in size:
+   The code below demonstrates the use of ``list`` to list all items in a
+   container that are over 10MiB in size:
 
-.. literalinclude:: ../../examples/list.py
-   :language: python
+   .. literalinclude:: ../../examples/list.py
+      :language: python
 
 Post
 ~~~~
@@ -470,14 +482,13 @@ described below:
     that each time user metadata is updated, the complete set of desired
     key-value pairs must be specified.
 
-Example
-^^^^^^^
+.. topic:: Example
 
-The code below demonstrates the use of ``post`` to set an archive folder in a
-given container to expire after a 24 hour delay:
+   The code below demonstrates the use of ``post`` to set an archive folder in
+   a given container to expire after a 24 hour delay:
 
-.. literalinclude:: ../../examples/post.py
-   :language: python
+   .. literalinclude:: ../../examples/post.py
+      :language: python
 
 Download
 ~~~~~~~~
@@ -538,14 +549,13 @@ below:
         'response_dict': <HTTP response details>
     }
 
-Example
-^^^^^^^
+.. topic:: Example
 
-The code below demonstrates the use of ``download`` to download all PNG images
-from a dated archive folder in a given container:
+   The code below demonstrates the use of ``download`` to download all PNG
+   images from a dated archive folder in a given container:
 
-.. literalinclude:: ../../examples/download.py
-   :language: python
+   .. literalinclude:: ../../examples/download.py
+      :language: python
 
 Upload
 ~~~~~~
@@ -632,16 +642,15 @@ below:
         'attempts': <attempt count>
     }
 
-Example
-^^^^^^^
+.. topic:: Example
 
-The code below demonstrates the use of ``upload`` to upload all files and
-folders in a given directory, and rename each object by replacing the root
-directory name with 'my-<d>-objects', where <d> is the name of the uploaded
-directory:
+   The code below demonstrates the use of ``upload`` to upload all files and
+   folders in a given directory, and rename each object by replacing the root
+   directory name with 'my-<d>-objects', where <d> is the name of the uploaded
+   directory:
 
-.. literalinclude:: ../../examples/upload.py
-   :language: python
+   .. literalinclude:: ../../examples/upload.py
+      :language: python
 
 Delete
 ~~~~~~
@@ -730,17 +739,78 @@ below:
         'response_dict': <HTTP response details>
     }
 
-Example
-^^^^^^^
+.. topic:: Example
 
-The code below demonstrates the use of ``delete`` to remove a given list of
-objects from a specified container. As the objects are deleted the transaction
-id of the relevant request is printed along with the object name and number
-of attempts required. By printing the transaction id, the printed operations
-can be easily linked to events in the swift server logs:
+   The code below demonstrates the use of ``delete`` to remove a given list of
+   objects from a specified container. As the objects are deleted the
+   transaction ID of the relevant request is printed along with the object name
+   and number of attempts required. By printing the transaction ID, the printed
+   operations can be easily linked to events in the swift server logs:
 
-.. literalinclude:: ../../examples/delete.py
-   :language: python
+   .. literalinclude:: ../../examples/delete.py
+      :language: python
+
+Copy
+~~~~
+
+Copy can be called to copy an object or update the metadata on the given items.
+
+Each element of the object list may be a plain string of the object name, or a
+``SwiftCopyObject`` that allows finer control over the options applied to each
+of the individual copy operations (destination, fresh_metadata, options).
+
+Destination should be in format /container/object; if not set, the object will be
+copied onto itself. Fresh_metadata sets mode of operation on metadata. If not set,
+current object user metadata will be copied/preserved; if set, all current user
+metadata will be removed.
+
+Returns an iterator over the results generated for each object copy (and may
+also include the results of creating destination containers).
+
+When a string is given for the object name, destination and fresh metadata will
+default to None and None, which result in adding metadata to existing objects.
+
+Successful copy results are dictionaries as described below:
+
+.. code-block:: python
+
+   {
+       'action': 'copy_object',
+       'success': True,
+       'container': <container>,
+       'object': <object>,
+       'destination': <destination>,
+       'headers': {},
+       'fresh_metadata': <boolean>,
+       'response_dict': <HTTP response details>
+   }
+
+Any failure in a copy operation will return a failure dictionary as described
+below:
+
+.. code-block:: python
+
+   {
+       'action': 'copy_object',
+       'success': False,
+       'container': <container>,
+       'object': <object>,
+       'destination': <destination>,
+       'headers': {},
+       'fresh_metadata': <boolean>,
+       'response_dict': <HTTP response details>,
+       'error': <error>,
+       'traceback': <traceback>,
+       'error_timestamp': <timestamp>
+   }
+
+.. topic:: Example
+
+   The code below demonstrates the use of ``copy`` to add new user metadata for
+   objects a and b, and to copy object c to d (with added metadata).
+
+   .. literalinclude:: ../../examples/copy.py
+      :language: python
 
 Capabilities
 ~~~~~~~~~~~~
@@ -756,6 +826,8 @@ the method docstring.
 For each successful call to list capabilities, a result dictionary will be
 returned with the contents described below:
 
+.. code-block:: python
+
     {
         'action': 'capabilities',
         'timestamp': <time of the call>,
@@ -764,7 +836,7 @@ returned with the contents described below:
     }
 
 The contents of the capabilities dictionary contain the core swift capabilities
-under the key ``swift``, all other keys show the configuration options for
+under the key ``swift``; all other keys show the configuration options for
 additional middlewares deployed in the proxy pipeline. An example capabilities
 dictionary is given below:
 
@@ -815,13 +887,12 @@ dictionary is given below:
         }
     }
 
-Example
-^^^^^^^
+.. topic:: Example
 
-The code below demonstrates the use of ``capabilities`` to determine if the
-Swift cluster supports static large objects, and if so,  the maximum number of
-segments that can be described in a single manifest file, along with the
-size restrictions on those objects:
+   The code below demonstrates the use of ``capabilities`` to determine if the
+   Swift cluster supports static large objects, and if so, the maximum number
+   of segments that can be described in a single manifest file, along with the
+   size restrictions on those objects:
 
-.. literalinclude:: ../../examples/capabilities.py
-   :language: python
+   .. literalinclude:: ../../examples/capabilities.py
+      :language: python

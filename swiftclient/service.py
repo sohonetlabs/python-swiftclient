@@ -29,11 +29,10 @@ from posixpath import join as urljoin
 from random import shuffle
 from time import time
 from threading import Thread
-from six import StringIO, text_type
+from six import Iterator, StringIO, string_types, text_type
 from six.moves.queue import Queue
 from six.moves.queue import Empty as QueueEmpty
 from six.moves.urllib.parse import quote
-from six import Iterator, string_types
 
 import json
 
@@ -44,12 +43,14 @@ from swiftclient.command_helpers import (
 )
 from swiftclient.utils import (
     config_true_value, ReadableToIterable, LengthWrapper, EMPTY_ETAG,
-    parse_api_response, report_traceback, n_groups
+    parse_api_response, report_traceback, n_groups, split_request_headers,
+    n_at_a_time
 )
 from swiftclient.exceptions import ClientException
 from swiftclient.multithreading import MultiThreadingManager
 
 
+DISK_BUFFER = 2 ** 16
 logger = logging.getLogger("swiftclient.service")
 
 
@@ -143,6 +144,7 @@ def _build_default_global_options():
         "user": environ.get('ST_USER'),
         "key": environ.get('ST_KEY'),
         "retries": 5,
+        "force_auth_retry": False,
         "os_username": environ.get('OS_USERNAME'),
         "os_user_id": environ.get('OS_USER_ID'),
         "os_user_domain_name": environ.get('OS_USER_DOMAIN_NAME'),
@@ -200,7 +202,10 @@ _default_local_options = {
     'human': False,
     'dir_marker': False,
     'checksum': True,
-    'shuffle': False
+    'shuffle': False,
+    'destination': None,
+    'fresh_metadata': False,
+    'ignore_mtime': False,
 }
 
 POLICY = 'X-Storage-Policy'
@@ -257,7 +262,8 @@ def get_conn(options):
                       insecure=options['insecure'],
                       cert=options['os_cert'],
                       cert_key=options['os_key'],
-                      ssl_compression=options['ssl_compression'])
+                      ssl_compression=options['ssl_compression'],
+                      force_auth_retry=options['force_auth_retry'])
 
 
 def mkdirs(path):
@@ -272,20 +278,19 @@ def split_headers(options, prefix=''):
     """
     Splits 'Key: Value' strings and returns them as a dictionary.
 
-    :param options: An array of 'Key: Value' strings
+    :param options: Must be one of:
+        * an iterable of 'Key: Value' strings
+        * an iterable of ('Key', 'Value') pairs
+        * a dict of {'Key': 'Value'} pairs
     :param prefix: String to prepend to all of the keys in the dictionary.
         reporting.
     """
     headers = {}
-    for item in options:
-        split_item = item.split(':', 1)
-        if len(split_item) == 2:
-            headers[(prefix + split_item[0]).title()] = split_item[1]
-        else:
-            raise SwiftError(
-                "Metadata parameter %s must contain a ':'.\n%s"
-                % (item, "Example: 'Color:Blue' or 'Size:Large'")
-            )
+    try:
+        headers = split_request_headers(options, prefix)
+    except ValueError as e:
+        raise SwiftError(e)
+
     return headers
 
 
@@ -321,13 +326,48 @@ class SwiftPostObject(object):
     specified separately for each individual object.
     """
     def __init__(self, object_name, options=None):
-        if not isinstance(object_name, string_types) or not object_name:
+        if not (isinstance(object_name, string_types) and object_name):
             raise SwiftError(
                 "Object names must be specified as non-empty strings"
             )
+        self.object_name = object_name
+        self.options = options
+
+
+class SwiftCopyObject(object):
+    """
+    Class for specifying an object copy,
+    allowing the destination/headers/metadata/fresh_metadata to be specified
+    separately for each individual object.
+    destination and fresh_metadata should be set in options
+    """
+    def __init__(self, object_name, options=None):
+        if not (isinstance(object_name, string_types) and object_name):
+            raise SwiftError(
+                "Object names must be specified as non-empty strings"
+            )
+
+        self.object_name = object_name
+        self.options = options
+
+        if self.options is None:
+            self.destination = None
+            self.fresh_metadata = False
         else:
-            self.object_name = object_name
-            self.options = options
+            self.destination = self.options.get('destination')
+            self.fresh_metadata = self.options.get('fresh_metadata', False)
+
+        if self.destination is not None:
+            destination_components = self.destination.split('/')
+            if destination_components[0] or len(destination_components) < 2:
+                raise SwiftError("destination must be in format /cont[/obj]")
+            if not destination_components[-1]:
+                raise SwiftError("destination must not end in a slash")
+            if len(destination_components) == 2:
+                # only container set in destination
+                self.destination = "{0}/{1}".format(
+                    self.destination, object_name
+                )
 
 
 class _SwiftReader(object):
@@ -336,16 +376,30 @@ class _SwiftReader(object):
     errors on failures caused by either invalid md5sum or size of the
     data read.
     """
-    def __init__(self, path, body, headers):
+    def __init__(self, path, body, headers, checksum=True):
         self._path = path
         self._body = body
         self._actual_read = 0
         self._content_length = None
         self._actual_md5 = None
-        self._expected_etag = headers.get('etag')
+        self._expected_md5 = headers.get('etag', '')
 
-        if ('x-object-manifest' not in headers
-                and 'x-static-large-object' not in headers):
+        if len(self._expected_md5) > 1 and self._expected_md5[0] == '"' \
+                and self._expected_md5[-1] == '"':
+            self._expected_md5 = self._expected_md5[1:-1]
+
+        # Some headers indicate the MD5 of the response
+        # definitely *won't* match the ETag
+        bad_md5_headers = set([
+            'content-range',
+            'x-object-manifest',
+            'x-static-large-object',
+        ])
+        if bad_md5_headers.intersection(headers):
+            # This isn't a useful checksum
+            self._expected_md5 = ''
+
+        if self._expected_md5 and checksum:
             self._actual_md5 = md5()
 
         if 'content-length' in headers:
@@ -363,12 +417,12 @@ class _SwiftReader(object):
         self._check_contents()
 
     def _check_contents(self):
-        if self._actual_md5 and self._expected_etag:
+        if self._actual_md5 and self._expected_md5:
             etag = self._actual_md5.hexdigest()
-            if etag != self._expected_etag:
+            if etag != self._expected_md5:
                 raise SwiftError('Error downloading {0}: md5sum != etag, '
                                  '{1} != {2}'.format(
-                                     self._path, etag, self._expected_etag))
+                                     self._path, etag, self._expected_md5))
 
         if (self._content_length is not None
                 and self._actual_read != self._content_length):
@@ -430,14 +484,15 @@ class SwiftService(object):
                         performed by this call::
 
                             {
-                                'human': False
+                                'human': False,
+                                'header': []
                             }
 
         :returns: Either a single dictionary containing stats about an account
                   or container, or an iterator for returning the results of the
                   stat operations on a list of objects.
 
-        :raises: SwiftError
+        :raises SwiftError:
         """
         if options is not None:
             options = dict(self._options, **options)
@@ -601,7 +656,7 @@ class SwiftService(object):
                   container/account, or an iterator for returning the results
                   of posts to a list of objects.
 
-        :raises: SwiftError
+        :raises SwiftError:
         """
         if options is not None:
             options = dict(self._options, **options)
@@ -812,6 +867,7 @@ class SwiftService(object):
                                 'long': False,
                                 'prefix': None,
                                 'delimiter': None,
+                                'header': []
                             }
 
         :returns: A generator for returning the results of the list operation
@@ -847,10 +903,12 @@ class SwiftService(object):
     def _list_account_job(conn, options, result_queue):
         marker = ''
         error = None
+        req_headers = split_headers(options.get('header', []))
         try:
             while True:
                 _, items = conn.get_account(
-                    marker=marker, prefix=options['prefix']
+                    marker=marker, prefix=options['prefix'],
+                    headers=req_headers
                 )
 
                 if not items:
@@ -906,11 +964,12 @@ class SwiftService(object):
     def _list_container_job(conn, container, options, result_queue):
         marker = options.get('marker', '')
         error = None
+        req_headers = split_headers(options.get('header', []))
         try:
             while True:
                 _, items = conn.get_container(
                     container, marker=marker, prefix=options['prefix'],
-                    delimiter=options['delimiter']
+                    delimiter=options['delimiter'], headers=req_headers
                 )
 
                 if not items:
@@ -980,6 +1039,7 @@ class SwiftService(object):
                                 'header': [],
                                 'skip_identical': False,
                                 'out_directory': None,
+                                'checksum': True,
                                 'out_file': None,
                                 'remove_prefix': False,
                                 'shuffle' : False
@@ -990,8 +1050,8 @@ class SwiftService(object):
                   'download_object' dictionary containing the results of an
                   individual file download.
 
-        :raises: ClientException
-        :raises: SwiftError
+        :raises ClientException:
+        :raises SwiftError:
         """
         if options is not None:
             options = dict(self._options, **options)
@@ -1069,14 +1129,14 @@ class SwiftService(object):
         if options['skip_identical']:
             filename = out_file if out_file else path
             try:
-                fp = open(filename, 'rb')
+                fp = open(filename, 'rb', DISK_BUFFER)
             except IOError:
                 pass
             else:
                 with fp:
                     md5sum = md5()
                     while True:
-                        data = fp.read(65536)
+                        data = fp.read(DISK_BUFFER)
                         if not data:
                             break
                         md5sum.update(data)
@@ -1084,7 +1144,7 @@ class SwiftService(object):
 
         try:
             start_time = time()
-            get_args = {'resp_chunk_size': 65536,
+            get_args = {'resp_chunk_size': DISK_BUFFER,
                         'headers': req_headers,
                         'response_dict': results_dict}
             if options['skip_identical']:
@@ -1135,7 +1195,8 @@ class SwiftService(object):
 
             headers_receipt = time()
 
-            obj_body = _SwiftReader(path, body, headers)
+            obj_body = _SwiftReader(path, body, headers,
+                                    options.get('checksum', True))
 
             no_file = options['no_download']
             if out_file == "-" and not no_file:
@@ -1166,10 +1227,10 @@ class SwiftService(object):
 
                     if not no_file:
                         if out_file:
-                            fp = open(out_file, 'wb')
+                            fp = open(out_file, 'wb', DISK_BUFFER)
                         else:
                             if basename(path):
-                                fp = open(path, 'wb')
+                                fp = open(path, 'wb', DISK_BUFFER)
                             else:
                                 pseudodir = True
 
@@ -1183,7 +1244,8 @@ class SwiftService(object):
                 bytes_read = obj_body.bytes_read()
                 if fp is not None:
                     fp.close()
-                    if 'x-object-meta-mtime' in headers and not no_file:
+                    if ('x-object-meta-mtime' in headers and not no_file
+                            and not options['ignore_mtime']):
                         try:
                             mtime = float(headers['x-object-meta-mtime'])
                         except ValueError:
@@ -1354,8 +1416,8 @@ class SwiftService(object):
 
         :returns: A generator for returning the results of the uploads.
 
-        :raises: SwiftError
-        :raises: ClientException
+        :raises SwiftError:
+        :raises ClientException:
         """
         if options is not None:
             options = dict(self._options, **options)
@@ -1442,7 +1504,8 @@ class SwiftService(object):
             if hasattr(s, 'read'):
                 # We've got a file like object to upload to o
                 file_future = self.thread_manager.object_uu_pool.submit(
-                    self._upload_object_job, container, s, o, object_options
+                    self._upload_object_job, container, s, o, object_options,
+                    results_queue=rq
                 )
                 details['file'] = s
                 details['object'] = o
@@ -1672,8 +1735,9 @@ class SwiftService(object):
                                             segment_name),
             'log_line': '%s segment %s' % (obj_name, segment_index),
         }
+        fp = None
         try:
-            fp = open(path, 'rb')
+            fp = open(path, 'rb', DISK_BUFFER)
             fp.seek(segment_start)
 
             contents = LengthWrapper(fp, segment_size, md5=options['checksum'])
@@ -1719,6 +1783,135 @@ class SwiftService(object):
             if results_queue is not None:
                 results_queue.put(res)
             return res
+        finally:
+            if fp is not None:
+                fp.close()
+
+    @staticmethod
+    def _put_object(conn, container, name, content, headers=None, md5=None):
+        """
+        Upload object into a given container and verify the resulting ETag, if
+        the md5 optional parameter is passed.
+
+        :param conn: The Swift connection to use for uploads.
+        :param container: The container to put the object into.
+        :param name: The name of the object.
+        :param content: Object content.
+        :param headers: Headers (optional) to associate with the object.
+        :param md5: MD5 sum of the content. If passed in, will be used to
+                    verify the returned ETag.
+
+        :returns: A dictionary as the response from calling put_object.
+                  The keys are:
+                    - status
+                    - reason
+                    - headers
+                  On error, the dictionary contains the following keys:
+                    - success (with value False)
+                    - error - the encountered exception (object)
+                    - error_timestamp
+                    - response_dict - results from the put_object call, as
+                      documented above
+                    - attempts - number of attempts made
+        """
+        if headers is None:
+            headers = {}
+        else:
+            headers = dict(headers)
+        if md5 is not None:
+            headers['etag'] = md5
+        results = {}
+        try:
+            etag = conn.put_object(
+                container, name, content, content_length=len(content),
+                headers=headers, response_dict=results)
+            if md5 is not None and etag != md5:
+                raise SwiftError('Upload verification failed for {0}: md5 '
+                                 'mismatch {1} != {2}'.format(name, md5, etag))
+            results['success'] = True
+        except Exception as err:
+            traceback, err_time = report_traceback()
+            logger.exception(err)
+            return {
+                'success': False,
+                'error': err,
+                'error_timestamp': err_time,
+                'response_dict': results,
+                'attempts': conn.attempts,
+                'traceback': traceback
+            }
+        return results
+
+    @staticmethod
+    def _upload_stream_segment(conn, container, object_name,
+                               segment_container, segment_name,
+                               segment_size, segment_index,
+                               headers, fd):
+        """
+        Upload a segment from a stream, buffering it in memory first. The
+        resulting object is placed either as a segment in the segment
+        container, or if it is smaller than a single segment, as the given
+        object name.
+
+        :param conn: Swift Connection to use.
+        :param container: Container in which the object would be placed.
+        :param object_name: Name of the final object (used in case the stream
+                            is smaller than the segment_size)
+        :param segment_container: Container to hold the object segments.
+        :param segment_name: The name of the segment.
+        :param segment_size: Minimum segment size.
+        :param segment_index: The segment index.
+        :param headers: Headers to attach to the segment/object.
+        :param fd: File-like handle for the content. Must implement read().
+
+        :returns: Dictionary, containing the following keys:
+                    - complete -- whether the stream is exhausted
+                    - segment_size - the actual size of the segment (may be
+                                     smaller than the passed in segment_size)
+                    - segment_location - path to the segment
+                    - segment_index - index of the segment
+                    - segment_etag - the ETag for the segment
+        """
+        buf = []
+        dgst = md5()
+        bytes_read = 0
+        while bytes_read < segment_size:
+            data = fd.read(segment_size - bytes_read)
+            if not data:
+                break
+            bytes_read += len(data)
+            dgst.update(data)
+            buf.append(data)
+        buf = b''.join(buf)
+        segment_hash = dgst.hexdigest()
+
+        if not buf and segment_index > 0:
+            # Happens if the segment size aligns with the object size
+            return {'complete': True,
+                    'segment_size': 0,
+                    'segment_index': None,
+                    'segment_etag': None,
+                    'segment_location': None,
+                    'success': True}
+
+        if segment_index == 0 and len(buf) < segment_size:
+            ret = SwiftService._put_object(
+                conn, container, object_name, buf, headers, segment_hash)
+            ret['segment_location'] = '/%s/%s' % (container, object_name)
+        else:
+            ret = SwiftService._put_object(
+                conn, segment_container, segment_name, buf, headers,
+                segment_hash)
+            ret['segment_location'] = '/%s/%s' % (
+                segment_container, segment_name)
+
+        ret.update(
+            dict(complete=len(buf) < segment_size,
+                 segment_size=len(buf),
+                 segment_index=segment_index,
+                 segment_etag=segment_hash,
+                 for_object=object_name))
+        return ret
 
     def _get_chunk_data(self, conn, container, obj, headers, manifest=None):
         chunks = []
@@ -1747,8 +1940,10 @@ class SwiftService(object):
         return chunks
 
     def _is_identical(self, chunk_data, path):
+        if path is None:
+            return False
         try:
-            fp = open(path, 'rb')
+            fp = open(path, 'rb', DISK_BUFFER)
         except IOError:
             return False
 
@@ -1757,7 +1952,7 @@ class SwiftService(object):
                 to_read = chunk['bytes']
                 md5sum = md5()
                 while to_read:
-                    data = fp.read(min(65536, to_read))
+                    data = fp.read(min(DISK_BUFFER, to_read))
                     if not data:
                         return False
                     md5sum.update(data)
@@ -1766,6 +1961,47 @@ class SwiftService(object):
                     return False
             # Each chunk is verified; check that we're at the end of the file
             return not fp.read(1)
+
+    @staticmethod
+    def _upload_slo_manifest(conn, segment_results, container, obj, headers):
+        """
+        Upload an SLO manifest, given the results of uploading each segment, to
+        the specified container.
+
+        :param segment_results: List of response_dict structures, as populated
+                                by _upload_segment_job. Specifically, each
+                                entry must container the following keys:
+                                - segment_location
+                                - segment_etag
+                                - segment_size
+                                - segment_index
+        :param container: The container to put the manifest into.
+        :param obj: The name of the manifest object to use.
+        :param headers: Optional set of headers to attach to the manifest.
+        """
+        if headers is None:
+            headers = {}
+        segment_results.sort(key=lambda di: di['segment_index'])
+        for seg in segment_results:
+            seg_loc = seg['segment_location'].lstrip('/')
+            if isinstance(seg_loc, text_type):
+                seg_loc = seg_loc.encode('utf-8')
+
+        manifest_data = json.dumps([
+            {
+                'path': d['segment_location'],
+                'etag': d['segment_etag'],
+                'size_bytes': d['segment_size']
+            } for d in segment_results
+        ])
+
+        response = {}
+        conn.put_object(
+            container, obj, manifest_data,
+            headers=headers,
+            query_string='multipart-manifest=put',
+            response_dict=response)
+        return response
 
     def _upload_object_job(self, conn, container, source, obj, options,
                            results_queue=None):
@@ -1851,6 +2087,8 @@ class SwiftService(object):
                         return res
 
             # Merge the command line header options to the put_headers
+            put_headers.update(split_headers(
+                options['meta'], 'X-Object-Meta-'))
             put_headers.update(split_headers(options['header'], ''))
 
             # Don't do segment job if object is not big enough, and never do
@@ -1922,30 +2160,11 @@ class SwiftService(object):
                 res['segment_results'] = segment_results
 
                 if options['use_slo']:
-                    segment_results.sort(key=lambda di: di['segment_index'])
-                    for seg in segment_results:
-                        seg_loc = seg['segment_location'].lstrip('/')
-                        if isinstance(seg_loc, text_type):
-                            seg_loc = seg_loc.encode('utf-8')
-                        new_slo_manifest_paths.add(seg_loc)
-
-                    manifest_data = json.dumps([
-                        {
-                            'path': d['segment_location'],
-                            'etag': d['segment_etag'],
-                            'size_bytes': d['segment_size']
-                        } for d in segment_results
-                    ])
-
-                    put_headers['x-static-large-object'] = 'true'
-                    mr = {}
-                    conn.put_object(
-                        container, obj, manifest_data,
-                        headers=put_headers,
-                        query_string='multipart-manifest=put',
-                        response_dict=mr
-                    )
-                    res['manifest_response_dict'] = mr
+                    response = self._upload_slo_manifest(
+                        conn, segment_results, container, obj, put_headers)
+                    res['manifest_response_dict'] = response
+                    new_slo_manifest_paths = {
+                        seg['segment_location'] for seg in segment_results}
                 else:
                     new_object_manifest = '%s/%s/%s/%s/%s/' % (
                         quote(seg_container.encode('utf8')),
@@ -1963,33 +2182,84 @@ class SwiftService(object):
                         response_dict=mr
                     )
                     res['manifest_response_dict'] = mr
+            elif options['use_slo'] and segment_size and not path:
+                segment = 0
+                results = []
+                while True:
+                    segment_name = '%s/slo/%s/%s/%08d' % (
+                        obj, put_headers['x-object-meta-mtime'],
+                        segment_size, segment
+                    )
+                    seg_container = container + '_segments'
+                    if options['segment_container']:
+                        seg_container = options['segment_container']
+                    ret = self._upload_stream_segment(
+                        conn, container, obj,
+                        seg_container,
+                        segment_name,
+                        segment_size,
+                        segment,
+                        put_headers,
+                        stream
+                    )
+                    if not ret['success']:
+                        return ret
+                    if (ret['complete'] and segment == 0) or\
+                            ret['segment_size'] > 0:
+                        results.append(ret)
+                    if results_queue is not None:
+                        # Don't insert the 0-sized segments or objects
+                        # themselves
+                        if ret['segment_location'] != '/%s/%s' % (
+                                container, obj) and ret['segment_size'] > 0:
+                            results_queue.put(ret)
+                    if ret['complete']:
+                        break
+                    segment += 1
+                if results[0]['segment_location'] != '/%s/%s' % (
+                        container, obj):
+                    response = self._upload_slo_manifest(
+                        conn, results, container, obj, put_headers)
+                    res['manifest_response_dict'] = response
+                    new_slo_manifest_paths = {
+                        r['segment_location'] for r in results}
+                    res['large_object'] = True
+                else:
+                    res['response_dict'] = ret
+                    res['large_object'] = False
             else:
                 res['large_object'] = False
                 obr = {}
-                if path is not None:
-                    content_length = getsize(path)
-                    contents = LengthWrapper(open(path, 'rb'),
-                                             content_length,
-                                             md5=options['checksum'])
-                else:
-                    content_length = None
-                    contents = ReadableToIterable(stream,
-                                                  md5=options['checksum'])
+                fp = None
+                try:
+                    if path is not None:
+                        content_length = getsize(path)
+                        fp = open(path, 'rb', DISK_BUFFER)
+                        contents = LengthWrapper(fp,
+                                                 content_length,
+                                                 md5=options['checksum'])
+                    else:
+                        content_length = None
+                        contents = ReadableToIterable(stream,
+                                                      md5=options['checksum'])
 
-                etag = conn.put_object(
-                    container, obj, contents,
-                    content_length=content_length, headers=put_headers,
-                    response_dict=obr
-                )
-                res['response_dict'] = obr
+                    etag = conn.put_object(
+                        container, obj, contents,
+                        content_length=content_length, headers=put_headers,
+                        response_dict=obr
+                    )
+                    res['response_dict'] = obr
 
-                if (options['checksum'] and
-                        etag and etag != contents.get_md5sum()):
-                    raise SwiftError('Object upload verification failed: '
-                                     'md5 mismatch, local {0} != remote {1} '
-                                     '(remote object has not been removed)'
-                                     .format(contents.get_md5sum(), etag))
-
+                    if (options['checksum'] and
+                            etag and etag != contents.get_md5sum()):
+                        raise SwiftError(
+                            'Object upload verification failed: '
+                            'md5 mismatch, local {0} != remote {1} '
+                            '(remote object has not been removed)'
+                            .format(contents.get_md5sum(), etag))
+                finally:
+                    if fp is not None:
+                        fp.close()
             if old_manifest or old_slo_manifest_paths:
                 drs = []
                 delobjsmap = {}
@@ -2073,6 +2343,7 @@ class SwiftService(object):
                                 'yes_all': False,
                                 'leave_segments': False,
                                 'prefix': None,
+                                'header': [],
                             }
 
         :returns: A generator for returning the results of the delete
@@ -2081,8 +2352,8 @@ class SwiftService(object):
                   'bulk_delete' dictionary containing the results of an
                   individual delete operation.
 
-        :raises: ClientException
-        :raises: SwiftError
+        :raises ClientException:
+        :raises SwiftError:
         """
         if options is not None:
             options = dict(self._options, **options)
@@ -2097,11 +2368,15 @@ class SwiftService(object):
                 rq = Queue()
                 obj_dels = {}
 
-                if self._should_bulk_delete(objects):
-                    for obj_slice in n_groups(
-                            objects, self._options['object_dd_threads']):
-                        self._bulk_delete(container, obj_slice, options,
-                                          obj_dels)
+                bulk_page_size = self._bulk_delete_page_size(objects)
+                if bulk_page_size > 1:
+                    page_at_a_time = n_at_a_time(objects, bulk_page_size)
+                    for page_slice in page_at_a_time:
+                        for obj_slice in n_groups(
+                                page_slice,
+                                self._options['object_dd_threads']):
+                            self._bulk_delete(container, obj_slice, options,
+                                              obj_dels)
                 else:
                     self._per_item_delete(container, objects, options,
                                           obj_dels, rq)
@@ -2154,23 +2429,36 @@ class SwiftService(object):
                                     and not res['success']):
                                 cancelled = True
 
-    def _should_bulk_delete(self, objects):
-        if len(objects) < 2 * self._options['object_dd_threads']:
+    def _bulk_delete_page_size(self, objects):
+        '''
+        Given the iterable 'objects', will return how many items should be
+        deleted at a time.
+
+        :param objects: An iterable that supports 'len()'
+        :returns: The bulk delete page size (i.e. the max number of
+                  objects that can be bulk deleted at once, as reported by
+                  the cluster). If bulk delete is disabled, return 1
+        '''
+        if len(objects) <= 2 * self._options['object_dd_threads']:
             # Not many objects; may as well delete one-by-one
-            return False
+            return 1
 
         try:
             cap_result = self.capabilities()
             if not cap_result['success']:
                 # This shouldn't actually happen, but just in case we start
                 # being more nuanced about our capabilities result...
-                return False
+                return 1
         except ClientException:
             # Old swift, presumably; assume no bulk middleware
-            return False
+            return 1
 
         swift_info = cap_result['capabilities']
-        return 'bulk_delete' in swift_info
+        if 'bulk_delete' in swift_info:
+            return swift_info['bulk_delete'].get(
+                'max_deletes_per_request', 10000)
+        else:
+            return 1
 
     def _per_item_delete(self, container, objects, options, rdict, rq):
         for obj in objects:
@@ -2211,6 +2499,8 @@ class SwiftService(object):
 
     def _delete_object(self, conn, container, obj, options,
                        results_queue=None):
+        _headers = {}
+        _headers = split_headers(options.get('header', []))
         res = {
             'action': 'delete_object',
             'container': container,
@@ -2222,7 +2512,8 @@ class SwiftService(object):
 
             if not options['leave_segments']:
                 try:
-                    headers = conn.head_object(container, obj)
+                    headers = conn.head_object(container, obj,
+                                               headers=_headers)
                     old_manifest = headers.get('x-object-manifest')
                     if config_true_value(headers.get('x-static-large-object')):
                         query_string = 'multipart-manifest=delete'
@@ -2231,7 +2522,9 @@ class SwiftService(object):
                         raise
 
             results_dict = {}
-            conn.delete_object(container, obj, query_string=query_string,
+            conn.delete_object(container, obj,
+                               headers=_headers,
+                               query_string=query_string,
                                response_dict=results_dict)
 
             if old_manifest:
@@ -2283,10 +2576,13 @@ class SwiftService(object):
         return res
 
     @staticmethod
-    def _delete_empty_container(conn, container):
+    def _delete_empty_container(conn, container, options):
         results_dict = {}
+        _headers = {}
+        _headers = split_headers(options.get('header', []))
         try:
-            conn.delete_container(container, response_dict=results_dict)
+            conn.delete_container(container, headers=_headers,
+                                  response_dict=results_dict)
             res = {'success': True}
         except Exception as err:
             traceback, err_time = report_traceback()
@@ -2324,7 +2620,7 @@ class SwiftService(object):
                 return
 
             con_del = self.thread_manager.container_pool.submit(
-                self._delete_empty_container, container
+                self._delete_empty_container, container, options
             )
             con_del_res = get_future_result(con_del)
 
@@ -2389,6 +2685,191 @@ class SwiftService(object):
 
         return res
 
+    # Copy related methods
+    #
+    def copy(self, container, objects, options=None):
+        """
+        Copy operations on a list of objects in a container. Destination
+        containers will be created.
+
+        :param container: The container from which to copy the objects.
+        :param objects: A list of object names (strings) or SwiftCopyObject
+                        instances containing an object name and an
+                        options dict (can be None) to override the options for
+                        that individual copy operation::
+
+                            [
+                                'object_name',
+                                SwiftCopyObject(
+                                    'object_name',
+                                     options={
+                                        'destination': '/container/object',
+                                        'fresh_metadata': False,
+                                        ...
+                                        }),
+                                ...
+                            ]
+
+                        The options dict is described below.
+        :param options: A dictionary containing options to override the global
+                        options specified during the service object creation.
+                        These options are applied to all copy operations
+                        performed by this call, unless overridden on a per
+                        object basis.
+                        The options "destination" and "fresh_metadata" do
+                        not need to be set, in this case objects will be
+                        copied onto themselves and metadata will not be
+                        refreshed.
+                        The option "destination" can also be specified in the
+                        format '/container', in which case objects without an
+                        explicit destination will be copied to the destination
+                        /container/original_object_name. Combinations of
+                        multiple objects and a destination in the format
+                        '/container/object' is invalid. Possible options are
+                        given below::
+
+                            {
+                                'meta': [],
+                                'header': [],
+                                'destination': '/container/object',
+                                'fresh_metadata': False,
+                            }
+
+        :returns: A generator returning the results of copying the given list
+                  of objects.
+
+        :raises SwiftError:
+        """
+        if options is not None:
+            options = dict(self._options, **options)
+        else:
+            options = self._options
+
+        # Try to create the container, just in case it doesn't exist. If this
+        # fails, it might just be because the user doesn't have container PUT
+        # permissions, so we'll ignore any error. If there's really a problem,
+        # it'll surface on the first object COPY.
+        containers = set(
+            next(p for p in obj.destination.split("/") if p)
+            for obj in objects
+            if isinstance(obj, SwiftCopyObject) and obj.destination
+        )
+        if options.get('destination'):
+            destination_split = options['destination'].split('/')
+            if destination_split[0]:
+                raise SwiftError("destination must be in format /cont[/obj]")
+            _str_objs = [
+                o for o in objects if not isinstance(o, SwiftCopyObject)
+            ]
+            if len(destination_split) > 2 and len(_str_objs) > 1:
+                # TODO (clayg): could be useful to copy multiple objects into
+                # a destination like "/container/common/prefix/for/objects/"
+                # where the trailing "/" indicates the destination option is a
+                # prefix!
+                raise SwiftError("Combination of multiple objects and "
+                                 "destination including object is invalid")
+            if destination_split[-1] == '':
+                # N.B. this protects the above case
+                raise SwiftError("destination can not end in a slash")
+            containers.add(destination_split[1])
+
+        policy_header = {}
+        _header = split_headers(options["header"])
+        if POLICY in _header:
+            policy_header[POLICY] = _header[POLICY]
+        create_containers = [
+            self.thread_manager.container_pool.submit(
+                self._create_container_job, cont, headers=policy_header)
+            for cont in containers
+        ]
+
+        # wait for container creation jobs to complete before any COPY
+        for r in interruptable_as_completed(create_containers):
+            res = r.result()
+            yield res
+
+        copy_futures = []
+        copy_objects = self._make_copy_objects(objects, options)
+        for copy_object in copy_objects:
+            obj = copy_object.object_name
+            obj_options = copy_object.options
+            destination = copy_object.destination
+            fresh_metadata = copy_object.fresh_metadata
+            headers = split_headers(
+                options['meta'], 'X-Object-Meta-')
+            # add header options to the headers object for the request.
+            headers.update(
+                split_headers(options['header'], ''))
+            if obj_options is not None:
+                if 'meta' in obj_options:
+                    headers.update(
+                        split_headers(
+                            obj_options['meta'], 'X-Object-Meta-'
+                        )
+                    )
+                if 'header' in obj_options:
+                    headers.update(
+                        split_headers(obj_options['header'], '')
+                    )
+
+            copy = self.thread_manager.object_uu_pool.submit(
+                self._copy_object_job, container, obj, destination,
+                headers, fresh_metadata
+            )
+            copy_futures.append(copy)
+
+        for r in interruptable_as_completed(copy_futures):
+            res = r.result()
+            yield res
+
+    @staticmethod
+    def _make_copy_objects(objects, options):
+        copy_objects = []
+
+        for o in objects:
+            if isinstance(o, string_types):
+                obj = SwiftCopyObject(o, options)
+                copy_objects.append(obj)
+            elif isinstance(o, SwiftCopyObject):
+                copy_objects.append(o)
+            else:
+                raise SwiftError(
+                    "The copy operation takes only strings or "
+                    "SwiftCopyObjects as input",
+                    obj=o)
+
+        return copy_objects
+
+    @staticmethod
+    def _copy_object_job(conn, container, obj, destination, headers,
+                         fresh_metadata):
+        response_dict = {}
+        res = {
+            'success': True,
+            'action': 'copy_object',
+            'container': container,
+            'object': obj,
+            'destination': destination,
+            'headers': headers,
+            'fresh_metadata': fresh_metadata,
+            'response_dict': response_dict
+        }
+        try:
+            conn.copy_object(
+                container, obj, destination=destination, headers=headers,
+                fresh_metadata=fresh_metadata, response_dict=response_dict)
+        except Exception as err:
+            traceback, err_time = report_traceback()
+            logger.exception(err)
+            res.update({
+                'success': False,
+                'error': err,
+                'traceback': traceback,
+                'error_timestamp': err_time
+            })
+
+        return res
+
     # Capabilities related methods
     #
     def capabilities(self, url=None, refresh_cache=False):
@@ -2399,7 +2880,7 @@ class SwiftService(object):
 
         :returns: A dictionary containing the capabilities of the cluster.
 
-        :raises: ClientException
+        :raises ClientException:
         """
         if not refresh_cache and url in self.capabilities_cache:
             return self.capabilities_cache[url]

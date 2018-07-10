@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gzip
+import json
 import logging
 import mock
 import six
@@ -24,11 +26,13 @@ import tempfile
 from hashlib import md5
 from six import binary_type
 from six.moves.urllib.parse import urlparse
+from requests.exceptions import RequestException
 
 from .utils import (MockHttpTest, fake_get_auth_keystone, StubResponse,
                     FakeKeystone, _make_fake_import_keystone_client)
 
 from swiftclient.utils import EMPTY_ETAG
+from swiftclient.exceptions import ClientException
 from swiftclient import client as c
 import swiftclient.utils
 import swiftclient
@@ -117,7 +121,7 @@ class MockHttpResponse(object):
         return self.headers.get(name, default)
 
     def getheaders(self):
-        return dict(self.headers)
+        return dict(self.headers).items()
 
     def fake_response(self):
         return self
@@ -185,9 +189,9 @@ class TestHttpHelpers(MockHttpTest):
 
     def test_encode_meta_headers(self):
         headers = {'abc': '123',
-                   u'x-container-meta-\u0394': '123',
-                   u'x-account-meta-\u0394': '123',
-                   u'x-object-meta-\u0394': '123'}
+                   u'x-container-meta-\u0394': 123,
+                   u'x-account-meta-\u0394': 12.3,
+                   u'x-object-meta-\u0394': True}
 
         r = swiftclient.encode_meta_headers(headers)
 
@@ -199,6 +203,7 @@ class TestHttpHelpers(MockHttpTest):
         for k, v in r.items():
             self.assertIs(type(k), binary_type)
             self.assertIs(type(v), binary_type)
+            self.assertIn(v, (b'123', b'12.3', b'True'))
 
     def test_set_user_agent_default(self):
         _junk, conn = c.http_connection('http://www.example.com')
@@ -335,79 +340,84 @@ class TestGetAuth(MockHttpTest):
     def test_auth_v2_with_tenant_name(self):
         os_options = {'tenant_name': 'asdf'}
         req_args = {'auth_version': '2.0'}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options,
-                                                     required_kwargs=req_args)
-        url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
-                                os_options=os_options,
-                                auth_version="2.0")
+        ks = fake_get_auth_keystone(os_options, required_kwargs=req_args)
+        with mock.patch('swiftclient.client.get_auth_keystone', ks):
+            url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
+                                    os_options=os_options,
+                                    auth_version="2.0")
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
     def test_auth_v2_with_tenant_id(self):
         os_options = {'tenant_id': 'asdf'}
         req_args = {'auth_version': '2.0'}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options,
-                                                     required_kwargs=req_args)
-        url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
-                                os_options=os_options,
-                                auth_version="2.0")
+        ks = fake_get_auth_keystone(os_options, required_kwargs=req_args)
+        with mock.patch('swiftclient.client.get_auth_keystone', ks):
+            url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
+                                    os_options=os_options,
+                                    auth_version="2.0")
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
     def test_auth_v2_with_project_name(self):
         os_options = {'project_name': 'asdf'}
         req_args = {'auth_version': '2.0'}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options,
-                                                     required_kwargs=req_args)
-        url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
-                                os_options=os_options,
-                                auth_version="2.0")
+        ks = fake_get_auth_keystone(os_options, required_kwargs=req_args)
+        with mock.patch('swiftclient.client.get_auth_keystone', ks):
+            url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
+                                    os_options=os_options,
+                                    auth_version="2.0")
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
     def test_auth_v2_with_project_id(self):
         os_options = {'project_id': 'asdf'}
         req_args = {'auth_version': '2.0'}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options,
-                                                     required_kwargs=req_args)
-        url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
-                                os_options=os_options,
-                                auth_version="2.0")
+
+        ks = fake_get_auth_keystone(os_options, required_kwargs=req_args)
+        with mock.patch('swiftclient.client.get_auth_keystone', ks):
+            url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
+                                    os_options=os_options,
+                                    auth_version="2.0")
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
     def test_auth_v2_no_tenant_name_or_tenant_id(self):
-        c.get_auth_keystone = fake_get_auth_keystone({})
-        self.assertRaises(c.ClientException, c.get_auth,
-                          'http://www.tests.com', 'asdf', 'asdf',
-                          os_options={},
-                          auth_version='2.0')
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone({})):
+            self.assertRaises(c.ClientException, c.get_auth,
+                              'http://www.tests.com', 'asdf', 'asdf',
+                              os_options={},
+                              auth_version='2.0')
 
     def test_auth_v2_with_tenant_name_none_and_tenant_id_none(self):
         os_options = {'tenant_name': None,
                       'tenant_id': None}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options)
-        self.assertRaises(c.ClientException, c.get_auth,
-                          'http://www.tests.com', 'asdf', 'asdf',
-                          os_options=os_options,
-                          auth_version='2.0')
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(os_options)):
+            self.assertRaises(c.ClientException, c.get_auth,
+                              'http://www.tests.com', 'asdf', 'asdf',
+                              os_options=os_options,
+                              auth_version='2.0')
 
     def test_auth_v2_with_tenant_user_in_user(self):
         tenant_option = {'tenant_name': 'foo'}
-        c.get_auth_keystone = fake_get_auth_keystone(tenant_option)
-        url, token = c.get_auth('http://www.test.com', 'foo:bar', 'asdf',
-                                os_options={},
-                                auth_version="2.0")
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(tenant_option)):
+            url, token = c.get_auth('http://www.test.com', 'foo:bar', 'asdf',
+                                    os_options={},
+                                    auth_version="2.0")
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
     def test_auth_v2_tenant_name_no_os_options(self):
         tenant_option = {'tenant_name': 'asdf'}
-        c.get_auth_keystone = fake_get_auth_keystone(tenant_option)
-        url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
-                                tenant_name='asdf',
-                                os_options={},
-                                auth_version="2.0")
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(tenant_option)):
+            url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
+                                    tenant_name='asdf',
+                                    os_options={},
+                                    auth_version="2.0")
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
@@ -415,138 +425,141 @@ class TestGetAuth(MockHttpTest):
         os_options = {'service_type': 'object-store',
                       'endpoint_type': 'internalURL',
                       'tenant_name': 'asdf'}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options)
-        url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
-                                os_options=os_options,
-                                auth_version="2.0")
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(os_options)):
+            url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
+                                    os_options=os_options,
+                                    auth_version="2.0")
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
     def test_auth_v2_with_tenant_user_in_user_no_os_options(self):
         tenant_option = {'tenant_name': 'foo'}
-        c.get_auth_keystone = fake_get_auth_keystone(tenant_option)
-        url, token = c.get_auth('http://www.test.com', 'foo:bar', 'asdf',
-                                auth_version="2.0")
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(tenant_option)):
+            url, token = c.get_auth('http://www.test.com', 'foo:bar', 'asdf',
+                                    auth_version="2.0")
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
     def test_auth_v2_with_os_region_name(self):
         os_options = {'region_name': 'good-region',
                       'tenant_name': 'asdf'}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options)
-        url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
-                                os_options=os_options,
-                                auth_version="2.0")
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(os_options)):
+            url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
+                                    os_options=os_options,
+                                    auth_version="2.0")
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
     def test_auth_v2_no_endpoint(self):
         os_options = {'region_name': 'unknown_region',
                       'tenant_name': 'asdf'}
-        c.get_auth_keystone = fake_get_auth_keystone(
-            os_options, c.ClientException)
-        self.assertRaises(c.ClientException, c.get_auth,
-                          'http://www.tests.com', 'asdf', 'asdf',
-                          os_options=os_options, auth_version='2.0')
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(os_options, c.ClientException)):
+            self.assertRaises(c.ClientException, c.get_auth,
+                              'http://www.tests.com', 'asdf', 'asdf',
+                              os_options=os_options, auth_version='2.0')
 
     def test_auth_v2_ks_exception(self):
-        c.get_auth_keystone = fake_get_auth_keystone(
-            {}, c.ClientException)
-        self.assertRaises(c.ClientException, c.get_auth,
-                          'http://www.tests.com', 'asdf', 'asdf',
-                          os_options={},
-                          auth_version='2.0')
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone({}, c.ClientException)):
+            self.assertRaises(c.ClientException, c.get_auth,
+                              'http://www.tests.com', 'asdf', 'asdf',
+                              os_options={},
+                              auth_version='2.0')
 
     def test_auth_v2_cacert(self):
         os_options = {'tenant_name': 'foo'}
-        c.get_auth_keystone = fake_get_auth_keystone(
-            os_options, None)
-
         auth_url_secure = 'https://www.tests.com'
         auth_url_insecure = 'https://www.tests.com/self-signed-certificate'
 
-        url, token = c.get_auth(auth_url_secure, 'asdf', 'asdf',
-                                os_options=os_options, auth_version='2.0',
-                                insecure=False)
-        self.assertTrue(url.startswith("http"))
-        self.assertTrue(token)
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(os_options, None)):
+            url, token = c.get_auth(auth_url_secure, 'asdf', 'asdf',
+                                    os_options=os_options, auth_version='2.0',
+                                    insecure=False)
+            self.assertTrue(url.startswith("http"))
+            self.assertTrue(token)
 
-        url, token = c.get_auth(auth_url_insecure, 'asdf', 'asdf',
-                                os_options=os_options, auth_version='2.0',
-                                cacert='ca.pem', insecure=False)
-        self.assertTrue(url.startswith("http"))
-        self.assertTrue(token)
+            url, token = c.get_auth(auth_url_insecure, 'asdf', 'asdf',
+                                    os_options=os_options, auth_version='2.0',
+                                    cacert='ca.pem', insecure=False)
+            self.assertTrue(url.startswith("http"))
+            self.assertTrue(token)
 
-        self.assertRaises(c.ClientException, c.get_auth,
-                          auth_url_insecure, 'asdf', 'asdf',
-                          os_options=os_options, auth_version='2.0')
-        self.assertRaises(c.ClientException, c.get_auth,
-                          auth_url_insecure, 'asdf', 'asdf',
-                          os_options=os_options, auth_version='2.0',
-                          insecure=False)
+            self.assertRaises(c.ClientException, c.get_auth,
+                              auth_url_insecure, 'asdf', 'asdf',
+                              os_options=os_options, auth_version='2.0')
+            self.assertRaises(c.ClientException, c.get_auth,
+                              auth_url_insecure, 'asdf', 'asdf',
+                              os_options=os_options, auth_version='2.0',
+                              insecure=False)
 
     def test_auth_v2_insecure(self):
         os_options = {'tenant_name': 'foo'}
-        c.get_auth_keystone = fake_get_auth_keystone(
-            os_options, None)
-
         auth_url_secure = 'https://www.tests.com'
         auth_url_insecure = 'https://www.tests.com/invalid-certificate'
 
-        url, token = c.get_auth(auth_url_secure, 'asdf', 'asdf',
-                                os_options=os_options, auth_version='2.0')
-        self.assertTrue(url.startswith("http"))
-        self.assertTrue(token)
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(os_options, None)):
+            url, token = c.get_auth(auth_url_secure, 'asdf', 'asdf',
+                                    os_options=os_options, auth_version='2.0')
+            self.assertTrue(url.startswith("http"))
+            self.assertTrue(token)
 
-        url, token = c.get_auth(auth_url_insecure, 'asdf', 'asdf',
-                                os_options=os_options, auth_version='2.0',
-                                insecure=True)
-        self.assertTrue(url.startswith("http"))
-        self.assertTrue(token)
+            url, token = c.get_auth(auth_url_insecure, 'asdf', 'asdf',
+                                    os_options=os_options, auth_version='2.0',
+                                    insecure=True)
+            self.assertTrue(url.startswith("http"))
+            self.assertTrue(token)
 
-        self.assertRaises(c.ClientException, c.get_auth,
-                          auth_url_insecure, 'asdf', 'asdf',
-                          os_options=os_options, auth_version='2.0')
-        self.assertRaises(c.ClientException, c.get_auth,
-                          auth_url_insecure, 'asdf', 'asdf',
-                          os_options=os_options, auth_version='2.0',
-                          insecure=False)
+            self.assertRaises(c.ClientException, c.get_auth,
+                              auth_url_insecure, 'asdf', 'asdf',
+                              os_options=os_options, auth_version='2.0')
+            self.assertRaises(c.ClientException, c.get_auth,
+                              auth_url_insecure, 'asdf', 'asdf',
+                              os_options=os_options, auth_version='2.0',
+                              insecure=False)
 
     def test_auth_v2_cert(self):
         os_options = {'tenant_name': 'foo'}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options, None)
-
         auth_url_no_sslauth = 'https://www.tests.com'
         auth_url_sslauth = 'https://www.tests.com/client-certificate'
 
-        url, token = c.get_auth(auth_url_no_sslauth, 'asdf', 'asdf',
-                                os_options=os_options, auth_version='2.0')
-        self.assertTrue(url.startswith("http"))
-        self.assertTrue(token)
+        with mock.patch('swiftclient.client.get_auth_keystone',
+                        fake_get_auth_keystone(os_options, None)):
+            url, token = c.get_auth(auth_url_no_sslauth, 'asdf', 'asdf',
+                                    os_options=os_options, auth_version='2.0')
+            self.assertTrue(url.startswith("http"))
+            self.assertTrue(token)
 
-        url, token = c.get_auth(auth_url_sslauth, 'asdf', 'asdf',
-                                os_options=os_options, auth_version='2.0',
-                                cert='minnie', cert_key='mickey')
-        self.assertTrue(url.startswith("http"))
-        self.assertTrue(token)
+            url, token = c.get_auth(auth_url_sslauth, 'asdf', 'asdf',
+                                    os_options=os_options, auth_version='2.0',
+                                    cert='minnie', cert_key='mickey')
+            self.assertTrue(url.startswith("http"))
+            self.assertTrue(token)
 
-        self.assertRaises(c.ClientException, c.get_auth,
-                          auth_url_sslauth, 'asdf', 'asdf',
-                          os_options=os_options, auth_version='2.0')
-        self.assertRaises(c.ClientException, c.get_auth,
-                          auth_url_sslauth, 'asdf', 'asdf',
-                          os_options=os_options, auth_version='2.0',
-                          cert='minnie')
+            self.assertRaises(c.ClientException, c.get_auth,
+                              auth_url_sslauth, 'asdf', 'asdf',
+                              os_options=os_options, auth_version='2.0')
+            self.assertRaises(c.ClientException, c.get_auth,
+                              auth_url_sslauth, 'asdf', 'asdf',
+                              os_options=os_options, auth_version='2.0',
+                              cert='minnie')
 
     def test_auth_v3_with_tenant_name(self):
         # check the correct auth version is passed to get_auth_keystone
         os_options = {'tenant_name': 'asdf'}
         req_args = {'auth_version': '3'}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options,
-                                                     required_kwargs=req_args)
-        url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
-                                os_options=os_options,
-                                auth_version="3")
+
+        ks = fake_get_auth_keystone(os_options, required_kwargs=req_args)
+        with mock.patch('swiftclient.client.get_auth_keystone', ks):
+            url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
+                                    os_options=os_options,
+                                    auth_version="3")
+
         self.assertTrue(url.startswith("http"))
         self.assertTrue(token)
 
@@ -554,11 +567,90 @@ class TestGetAuth(MockHttpTest):
         # check the correct auth version is passed to get_auth_keystone
         os_options = {'tenant_name': 'asdf'}
         req_args = {'auth_version': '2.0'}
-        c.get_auth_keystone = fake_get_auth_keystone(os_options,
-                                                     required_kwargs=req_args)
-        url, token = c.get_keystoneclient_2_0('http://www.test.com', 'asdf',
-                                              'asdf', os_options=os_options)
+
+        ks = fake_get_auth_keystone(os_options, required_kwargs=req_args)
+        with mock.patch('swiftclient.client.get_auth_keystone', ks):
+            url, token = c.get_keystoneclient_2_0('http://www.test.com',
+                                                  'asdf', 'asdf',
+                                                  os_options=os_options)
+
         self.assertTrue(url.startswith("http"))
+        self.assertTrue(token)
+
+    def test_get_auth_keystone_versionless(self):
+        fake_ks = FakeKeystone(endpoint='http://some_url', token='secret')
+
+        with mock.patch('swiftclient.client._import_keystone_client',
+                        _make_fake_import_keystone_client(fake_ks)):
+            c.get_auth_keystone('http://authurl', 'user', 'key', {})
+        self.assertEqual(1, len(fake_ks.calls))
+        self.assertEqual('http://authurl/v3', fake_ks.calls[0].get('auth_url'))
+
+    def test_get_auth_keystone_versionless_auth_version_set(self):
+        fake_ks = FakeKeystone(endpoint='http://some_url', token='secret')
+
+        with mock.patch('swiftclient.client._import_keystone_client',
+                        _make_fake_import_keystone_client(fake_ks)):
+            c.get_auth_keystone('http://auth_url', 'user', 'key',
+                                {}, auth_version='2.0')
+        self.assertEqual(1, len(fake_ks.calls))
+        self.assertEqual('http://auth_url/v2.0',
+                         fake_ks.calls[0].get('auth_url'))
+
+    def test_get_auth_keystone_versionful(self):
+        fake_ks = FakeKeystone(endpoint='http://some_url', token='secret')
+
+        with mock.patch('swiftclient.client._import_keystone_client',
+                        _make_fake_import_keystone_client(fake_ks)):
+            c.get_auth_keystone('http://auth_url/v3', 'user', 'key',
+                                {}, auth_version='3')
+        self.assertEqual(1, len(fake_ks.calls))
+        self.assertEqual('http://auth_url/v3',
+                         fake_ks.calls[0].get('auth_url'))
+
+    def test_get_auth_keystone_devstack_versionful(self):
+        fake_ks = FakeKeystone(
+            endpoint='http://storage.example.com/v1/AUTH_user', token='secret')
+        with mock.patch('swiftclient.client._import_keystone_client',
+                        _make_fake_import_keystone_client(fake_ks)):
+            c.get_auth_keystone('https://192.168.8.8/identity/v3',
+                                'user', 'key', {}, auth_version='3')
+        self.assertEqual(1, len(fake_ks.calls))
+        self.assertEqual('https://192.168.8.8/identity/v3',
+                         fake_ks.calls[0].get('auth_url'))
+
+    def test_get_auth_keystone_devstack_versionless(self):
+        fake_ks = FakeKeystone(
+            endpoint='http://storage.example.com/v1/AUTH_user', token='secret')
+        with mock.patch('swiftclient.client._import_keystone_client',
+                        _make_fake_import_keystone_client(fake_ks)):
+            c.get_auth_keystone('https://192.168.8.8/identity',
+                                'user', 'key', {}, auth_version='3')
+        self.assertEqual(1, len(fake_ks.calls))
+        self.assertEqual('https://192.168.8.8/identity/v3',
+                         fake_ks.calls[0].get('auth_url'))
+
+    def test_auth_keystone_url_some_junk_nonsense(self):
+        fake_ks = FakeKeystone(
+            endpoint='http://storage.example.com/v1/AUTH_user',
+            token='secret')
+        with mock.patch('swiftclient.client._import_keystone_client',
+                        _make_fake_import_keystone_client(fake_ks)):
+            c.get_auth_keystone('http://blah.example.com/v2moo',
+                                'user', 'key', {}, auth_version='3')
+        self.assertEqual(1, len(fake_ks.calls))
+        # v2 looks sorta version-y, but it's not an exact match, so this is
+        # probably about just as bad as anything else we might guess at
+        self.assertEqual('http://blah.example.com/v2moo/v3',
+                         fake_ks.calls[0].get('auth_url'))
+
+    def test_auth_with_session(self):
+        mock_session = mock.MagicMock()
+        mock_session.get_endpoint.return_value = 'http://storagehost/v1/acct'
+        mock_session.get_token.return_value = 'token'
+        url, token = c.get_auth('http://www.test.com', 'asdf', 'asdf',
+                                session=mock_session)
+        self.assertEqual(url, 'http://storagehost/v1/acct')
         self.assertTrue(token)
 
 
@@ -570,6 +662,7 @@ class TestGetAccount(MockHttpTest):
         self.assertEqual(value, [])
         self.assertRequests([
             ('GET', '/v1/acct?format=json', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'asdf'}),
         ])
 
@@ -580,6 +673,7 @@ class TestGetAccount(MockHttpTest):
         c.get_account('http://www.test.com/v1/acct', 'asdf', marker='marker')
         self.assertRequests([
             ('GET', '/v1/acct?format=json&marker=marker', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'asdf'}),
         ])
 
@@ -590,6 +684,7 @@ class TestGetAccount(MockHttpTest):
         c.get_account('http://www.test.com/v1/acct', 'asdf', limit=10)
         self.assertRequests([
             ('GET', '/v1/acct?format=json&limit=10', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'asdf'}),
         ])
 
@@ -600,6 +695,7 @@ class TestGetAccount(MockHttpTest):
         c.get_account('http://www.test.com/v1/acct', 'asdf', prefix='asdf/')
         self.assertRequests([
             ('GET', '/v1/acct?format=json&prefix=asdf/', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'asdf'}),
         ])
 
@@ -611,6 +707,7 @@ class TestGetAccount(MockHttpTest):
                       end_marker='end_marker')
         self.assertRequests([
             ('GET', '/v1/acct?format=json&end_marker=end_marker', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'asdf'}),
         ])
 
@@ -689,6 +786,7 @@ class TestGetContainer(MockHttpTest):
         self.assertEqual(value, [])
         self.assertRequests([
             ('GET', '/v1/acct/container?format=json', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'token'}),
         ])
 
@@ -700,6 +798,7 @@ class TestGetContainer(MockHttpTest):
                         marker='marker')
         self.assertRequests([
             ('GET', '/v1/acct/container?format=json&marker=marker', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'token'}),
         ])
 
@@ -711,6 +810,7 @@ class TestGetContainer(MockHttpTest):
                         limit=10)
         self.assertRequests([
             ('GET', '/v1/acct/container?format=json&limit=10', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'token'}),
         ])
 
@@ -722,6 +822,7 @@ class TestGetContainer(MockHttpTest):
                         prefix='asdf/')
         self.assertRequests([
             ('GET', '/v1/acct/container?format=json&prefix=asdf/', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'token'}),
         ])
 
@@ -733,6 +834,7 @@ class TestGetContainer(MockHttpTest):
                         delimiter='/')
         self.assertRequests([
             ('GET', '/v1/acct/container?format=json&delimiter=/', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'token'}),
         ])
 
@@ -744,7 +846,7 @@ class TestGetContainer(MockHttpTest):
                         end_marker='end_marker')
         self.assertRequests([
             ('GET', '/v1/acct/container?format=json&end_marker=end_marker',
-             '', {'x-auth-token': 'token'}),
+             '', {'x-auth-token': 'token', 'accept-encoding': 'gzip'}),
         ])
 
     def test_param_path(self):
@@ -755,6 +857,7 @@ class TestGetContainer(MockHttpTest):
                         path='asdf')
         self.assertRequests([
             ('GET', '/v1/acct/container?format=json&path=asdf', '', {
+                'accept-encoding': 'gzip',
                 'x-auth-token': 'token'}),
         ])
 
@@ -769,7 +872,19 @@ class TestGetContainer(MockHttpTest):
             ('GET', '/container?format=json', '', {
                 'x-auth-token': 'TOKEN',
                 'x-client-key': 'client key',
+                'accept-encoding': 'gzip',
             }),
+        ])
+
+    def test_query_string(self):
+        c.http_connection = self.fake_http_connection(
+            200, query_string="format=json&hello=20", body=b'[]')
+        c.get_container('http://www.test.com', 'asdf', 'asdf',
+                        query_string="hello=20")
+        self.assertRequests([
+            ('GET', '/asdf?format=json&hello=20', '', {
+                'accept-encoding': 'gzip',
+                'x-auth-token': 'asdf'}),
         ])
 
 
@@ -831,6 +946,17 @@ class TestPutContainer(MockHttpTest):
                 'content-length': '0'}),
         ])
 
+    def test_query_string(self):
+        c.http_connection = self.fake_http_connection(200,
+                                                      query_string="hello=20")
+        c.put_container('http://www.test.com', 'asdf', 'asdf',
+                        query_string="hello=20")
+        for req in self.iter_request_log():
+            self.assertEqual(req['method'], 'PUT')
+            self.assertEqual(req['parsed_path'].path, '/asdf')
+            self.assertEqual(req['parsed_path'].query, 'hello=20')
+            self.assertEqual(req['headers']['x-auth-token'], 'asdf')
+
 
 class TestDeleteContainer(MockHttpTest):
 
@@ -841,6 +967,16 @@ class TestDeleteContainer(MockHttpTest):
         self.assertRequests([
             ('DELETE', '/container', '', {
                 'x-auth-token': 'token'}),
+        ])
+
+    def test_query_string(self):
+        c.http_connection = self.fake_http_connection(200,
+                                                      query_string="hello=20")
+        c.delete_container('http://www.test.com', 'token', 'container',
+                           query_string="hello=20")
+        self.assertRequests([
+            ('DELETE', 'http://www.test.com/container?hello=20', '', {
+                'x-auth-token': 'token'})
         ])
 
 
@@ -1093,9 +1229,20 @@ class TestHeadObject(MockHttpTest):
             }),
         ])
 
+    def test_query_string(self):
+        c.http_connection = self.fake_http_connection(204)
+        conn = c.http_connection('http://www.test.com')
+        query_string = 'foo=bar'
+        c.head_object('url_is_irrelevant', 'token', 'container', 'key',
+                      http_conn=conn, query_string=query_string)
+        self.assertRequests([
+            ('HEAD', '/container/key?foo=bar', '', {'x-auth-token': 'token'})
+        ])
+
 
 class TestPutObject(MockHttpTest):
 
+    @mock.patch('swiftclient.requests.__version__', '2.2.0')
     def test_ok(self):
         c.http_connection = self.fake_http_connection(200)
         args = ('http://www.test.com', 'TOKEN', 'container', 'obj', 'body', 4)
@@ -1153,6 +1300,7 @@ class TestPutObject(MockHttpTest):
             self.assertEqual(len(w), 1)
             self.assertTrue(issubclass(w[-1].category, UserWarning))
 
+    @mock.patch('swiftclient.requests.__version__', '2.2.0')
     def test_server_error(self):
         body = 'c' * 60
         headers = {'foo': 'bar'}
@@ -1167,7 +1315,8 @@ class TestPutObject(MockHttpTest):
         self.assertEqual(e.http_status, 500)
         self.assertRequests([
             ('PUT', '/asdf/asdf', 'asdf', {
-                'x-auth-token': 'asdf', 'content-type': ''}),
+                'x-auth-token': 'asdf',
+                'content-type': ''}),
         ])
 
     def test_query_string(self):
@@ -1308,7 +1457,8 @@ class TestPutObject(MockHttpTest):
         self.assertEqual(request_header['etag'], b'1234-5678')
         self.assertEqual(request_header['content-type'], b'text/plain')
 
-    def test_no_content_type(self):
+    @mock.patch('swiftclient.requests.__version__', '2.2.0')
+    def test_no_content_type_old_requests(self):
         conn = c.http_connection(u'http://www.test.com/')
         resp = MockHttpResponse(status=200)
         conn[1].getresponse = resp.fake_response
@@ -1317,6 +1467,17 @@ class TestPutObject(MockHttpTest):
         c.put_object(url='http://www.test.com', http_conn=conn)
         request_header = resp.requests_params['headers']
         self.assertEqual(request_header['content-type'], b'')
+
+    @mock.patch('swiftclient.requests.__version__', '2.4.0')
+    def test_no_content_type_new_requests(self):
+        conn = c.http_connection(u'http://www.test.com/')
+        resp = MockHttpResponse(status=200)
+        conn[1].getresponse = resp.fake_response
+        conn[1]._request = resp._fake_request
+
+        c.put_object(url='http://www.test.com', http_conn=conn)
+        request_header = resp.requests_params['headers']
+        self.assertNotIn('content-type', request_header)
 
     def test_content_type_in_headers(self):
         conn = c.http_connection(u'http://www.test.com/')
@@ -1398,6 +1559,109 @@ class TestPostObject(MockHttpTest):
         ])
 
 
+class TestCopyObject(MockHttpTest):
+
+    def test_server_error(self):
+        c.http_connection = self.fake_http_connection(500)
+        self.assertRaises(
+            c.ClientException, c.copy_object,
+            'http://www.test.com/v1/AUTH', 'asdf', 'asdf', 'asdf')
+
+    def test_ok(self):
+        c.http_connection = self.fake_http_connection(200)
+        c.copy_object(
+            'http://www.test.com/v1/AUTH', 'token', 'container', 'obj',
+            destination='/container2/obj')
+        self.assertRequests([
+            ('COPY', 'http://www.test.com/v1/AUTH/container/obj', '', {
+                'X-Auth-Token': 'token',
+                'Destination': '/container2/obj',
+            }),
+        ])
+
+    def test_service_token(self):
+        c.http_connection = self.fake_http_connection(200)
+        c.copy_object('http://www.test.com/v1/AUTH', None, 'container',
+                      'obj', destination='/container2/obj',
+                      service_token="TOKEN")
+        self.assertRequests([
+            ('COPY', 'http://www.test.com/v1/AUTH/container/obj', '', {
+                'X-Service-Token': 'TOKEN',
+                'Destination': '/container2/obj',
+
+            }),
+        ])
+
+    def test_headers(self):
+        c.http_connection = self.fake_http_connection(200)
+        c.copy_object(
+            'http://www.test.com/v1/AUTH', 'token', 'container', 'obj',
+            destination='/container2/obj',
+            headers={'some-hdr': 'a', 'other-hdr': 'b'})
+        self.assertRequests([
+            ('COPY', 'http://www.test.com/v1/AUTH/container/obj', '', {
+                'X-Auth-Token': 'token',
+                'Destination': '/container2/obj',
+                'some-hdr': 'a',
+                'other-hdr': 'b',
+            }),
+        ])
+
+    def test_fresh_metadata_default(self):
+        c.http_connection = self.fake_http_connection(200)
+        c.copy_object(
+            'http://www.test.com/v1/AUTH', 'token', 'container', 'obj',
+            '/container2/obj', {'x-fresh-metadata': 'hdr-value'})
+        self.assertRequests([
+            ('COPY', 'http://www.test.com/v1/AUTH/container/obj', '', {
+                'X-Auth-Token': 'token',
+                'Destination': '/container2/obj',
+                'X-Fresh-Metadata': 'hdr-value',
+            }),
+        ])
+
+    def test_fresh_metadata_true(self):
+        c.http_connection = self.fake_http_connection(200)
+        c.copy_object(
+            'http://www.test.com/v1/AUTH', 'token', 'container', 'obj',
+            destination='/container2/obj',
+            headers={'x-fresh-metadata': 'hdr-value'},
+            fresh_metadata=True)
+        self.assertRequests([
+            ('COPY', 'http://www.test.com/v1/AUTH/container/obj', '', {
+                'X-Auth-Token': 'token',
+                'Destination': '/container2/obj',
+                'X-Fresh-Metadata': 'true',
+            }),
+        ])
+
+    def test_fresh_metadata_false(self):
+        c.http_connection = self.fake_http_connection(200)
+        c.copy_object(
+            'http://www.test.com/v1/AUTH', 'token', 'container', 'obj',
+            destination='/container2/obj',
+            headers={'x-fresh-metadata': 'hdr-value'},
+            fresh_metadata=False)
+        self.assertRequests([
+            ('COPY', 'http://www.test.com/v1/AUTH/container/obj', '', {
+                'x-auth-token': 'token',
+                'Destination': '/container2/obj',
+                'X-Fresh-Metadata': 'false',
+            }),
+        ])
+
+    def test_no_destination(self):
+        c.http_connection = self.fake_http_connection(200)
+        c.copy_object(
+            'http://www.test.com/v1/AUTH', 'token', 'container', 'obj')
+        self.assertRequests([
+            ('COPY', 'http://www.test.com/v1/AUTH/container/obj', '', {
+                'x-auth-token': 'token',
+                'Destination': '/container/obj',
+            }),
+        ])
+
+
 class TestDeleteObject(MockHttpTest):
 
     def test_ok(self):
@@ -1438,7 +1702,7 @@ class TestGetCapabilities(MockHttpTest):
         http_conn = conn('http://www.test.com/info')
         info = c.get_capabilities(http_conn)
         self.assertRequests([
-            ('GET', '/info', '', {}),
+            ('GET', '/info', '', {'Accept-Encoding': 'gzip'}),
         ])
         self.assertEqual(info, {})
         self.assertTrue(http_conn[1].resp.has_been_read)
@@ -1474,7 +1738,8 @@ class TestGetCapabilities(MockHttpTest):
             ('GET', '/auth/v1.0', '', {
                 'x-auth-user': 'user',
                 'x-auth-key': 'key'}),
-            ('GET', 'http://storage.example.com/info', '', {}),
+            ('GET', 'http://storage.example.com/info', '', {
+                'accept-encoding': 'gzip'}),
         ])
 
     def test_conn_get_capabilities_with_os_auth(self):
@@ -1762,6 +2027,71 @@ class TestConnection(MockHttpTest):
         self.assertIn('Account HEAD failed', str(exc_context.exception))
         self.assertEqual(conn.attempts, 1)
 
+    def test_retry_with_socket_error(self):
+        def quick_sleep(*args):
+            pass
+        c.sleep = quick_sleep
+        conn = c.Connection('http://www.test.com', 'asdf', 'asdf')
+        with mock.patch('swiftclient.client.http_connection') as \
+                fake_http_connection, \
+                mock.patch('swiftclient.client.get_auth_1_0') as mock_auth:
+            mock_auth.return_value = ('http://mock.com', 'mock_token')
+            fake_http_connection.side_effect = socket.error
+            self.assertRaises(socket.error, conn.head_account)
+        self.assertEqual(mock_auth.call_count, 1)
+        self.assertEqual(conn.attempts, conn.retries + 1)
+
+    def test_retry_with_force_auth_retry_exceptions(self):
+        def quick_sleep(*args):
+            pass
+
+        def do_test(exception):
+            c.sleep = quick_sleep
+            conn = c.Connection(
+                'http://www.test.com', 'asdf', 'asdf',
+                force_auth_retry=True)
+            with mock.patch('swiftclient.client.http_connection') as \
+                    fake_http_connection, \
+                    mock.patch('swiftclient.client.get_auth_1_0') as mock_auth:
+                mock_auth.return_value = ('http://mock.com', 'mock_token')
+                fake_http_connection.side_effect = exception
+                self.assertRaises(exception, conn.head_account)
+            self.assertEqual(mock_auth.call_count, conn.retries + 1)
+            self.assertEqual(conn.attempts, conn.retries + 1)
+
+        do_test(socket.error)
+        do_test(RequestException)
+
+    def test_retry_with_force_auth_retry_client_exceptions(self):
+        def quick_sleep(*args):
+            pass
+
+        def do_test(http_status, count):
+
+            def mock_http_connection(*args, **kwargs):
+                raise ClientException('fake', http_status=http_status)
+
+            c.sleep = quick_sleep
+            conn = c.Connection(
+                'http://www.test.com', 'asdf', 'asdf',
+                force_auth_retry=True)
+            with mock.patch('swiftclient.client.http_connection') as \
+                    fake_http_connection, \
+                    mock.patch('swiftclient.client.get_auth_1_0') as mock_auth:
+                mock_auth.return_value = ('http://mock.com', 'mock_token')
+                fake_http_connection.side_effect = mock_http_connection
+                self.assertRaises(ClientException, conn.head_account)
+            self.assertEqual(mock_auth.call_count, count)
+            self.assertEqual(conn.attempts, count)
+
+        # sanity, in case of 401, the auth will be called only twice because of
+        # retried_auth mechanism
+        do_test(401, 2)
+        # others will be tried until retry limits
+        do_test(408, 6)
+        do_test(500, 6)
+        do_test(503, 6)
+
     def test_resp_read_on_server_error(self):
         conn = c.Connection('http://www.test.com', 'asdf', 'asdf', retries=0)
 
@@ -1867,6 +2197,39 @@ class TestConnection(MockHttpTest):
             ('HEAD', '/v1/AUTH_test', '', {'x-auth-token': 'expired'}),
             ('HEAD', '/v1/AUTH_test', '', {'x-auth-token': 'token'}),
         ])
+
+    def test_session_no_invalidate(self):
+        mock_session = mock.MagicMock()
+        mock_session.get_endpoint.return_value = 'http://storagehost/v1/acct'
+        mock_session.get_token.return_value = 'expired'
+        mock_session.invalidate.return_value = False
+        conn = c.Connection(session=mock_session)
+        fake_conn = self.fake_http_connection(401)
+        with mock.patch.multiple('swiftclient.client',
+                                 http_connection=fake_conn,
+                                 sleep=mock.DEFAULT):
+            self.assertRaises(c.ClientException, conn.head_account)
+        self.assertEqual(mock_session.get_token.mock_calls, [mock.call()])
+        self.assertEqual(mock_session.invalidate.mock_calls, [mock.call()])
+
+    def test_session_can_invalidate(self):
+        mock_session = mock.MagicMock()
+        mock_session.get_endpoint.return_value = 'http://storagehost/v1/acct'
+        mock_session.get_token.side_effect = ['expired', 'token']
+        mock_session.invalidate.return_value = True
+        conn = c.Connection(session=mock_session)
+        fake_conn = self.fake_http_connection(401, 200)
+        with mock.patch.multiple('swiftclient.client',
+                                 http_connection=fake_conn,
+                                 sleep=mock.DEFAULT):
+            conn.head_account()
+        self.assertRequests([
+            ('HEAD', '/v1/acct', '', {'x-auth-token': 'expired'}),
+            ('HEAD', '/v1/acct', '', {'x-auth-token': 'token'}),
+        ])
+        self.assertEqual(mock_session.get_token.mock_calls, [
+            mock.call(), mock.call()])
+        self.assertEqual(mock_session.invalidate.mock_calls, [mock.call()])
 
     def test_preauth_token_with_no_storage_url_requires_auth(self):
         conn = c.Connection(
@@ -2113,7 +2476,7 @@ class TestConnection(MockHttpTest):
                 return 'header'
 
             def getheaders(self):
-                return {"key1": "value1", "key2": "value2"}
+                return [('key1', 'value1'), ('key2', 'value2')]
 
             def read(self, *args, **kwargs):
                 return ''
@@ -2196,6 +2559,7 @@ class TestConnection(MockHttpTest):
             ('GET', '/v1/a/c1?format=json&limit=5&prefix=p', '', {
                 'x-auth-token': 'token',
                 'X-Favourite-Pet': 'Aardvark',
+                'accept-encoding': 'gzip',
             }),
         ])
         self.assertEqual(conn.attempts, 1)
@@ -2219,16 +2583,17 @@ class TestConnection(MockHttpTest):
 
     def test_head_object(self):
         headers = {'X-Favourite-Pet': 'Aardvark'}
+        query_string = 'foo=bar'
         with mock.patch('swiftclient.client.http_connection',
                         self.fake_http_connection(200)):
             with mock.patch('swiftclient.client.get_auth',
                             lambda *a, **k: ('http://url:8080/v1/a', 'token')):
                 conn = c.Connection()
                 conn.head_object('c1', 'o1',
-                                 headers=headers)
+                                 headers=headers, query_string=query_string)
         self.assertEqual(1, len(self.request_log), self.request_log)
         self.assertRequests([
-            ('HEAD', '/v1/a/c1/o1', '', {
+            ('HEAD', '/v1/a/c1/o1?foo=bar', '', {
                 'x-auth-token': 'token',
                 'X-Favourite-Pet': 'Aardvark',
             }),
@@ -2246,6 +2611,7 @@ class TestResponseDict(MockHttpTest):
              ('delete_container', 'c'),
              ('post_object', 'c', 'o', {}),
              ('put_object', 'c', 'o', 'body'),
+             ('copy_object', 'c', 'o'),
              ('delete_object', 'c', 'o')]
 
     def fake_get_auth(*args, **kwargs):
@@ -2360,6 +2726,33 @@ class TestLogging(MockHttpTest):
         with self.assertRaises(c.ClientException) as exc_context:
             c.get_object('http://www.test.com', 'asdf', 'asdf', 'asdf')
         self.assertEqual(exc_context.exception.http_status, 404)
+
+    def test_content_encoding_gzip_body_is_logged_decoded(self):
+        buf = six.BytesIO()
+        gz = gzip.GzipFile(fileobj=buf, mode='w')
+        data = {"test": u"\u2603"}
+        decoded_body = json.dumps(data).encode('utf-8')
+        gz.write(decoded_body)
+        gz.close()
+        # stub a gzip encoded body
+        body = buf.getvalue()
+        headers = {'content-encoding': 'gzip'}
+        # ... and make a content-encoding gzip error response
+        stub_response = StubResponse(500, body, headers)
+        with mock.patch('swiftclient.client.logger.info') as mock_log:
+            # ... if the client gets such a response
+            c.http_connection = self.fake_http_connection(stub_response)
+            with self.assertRaises(c.ClientException) as exc_context:
+                c.get_object('http://www.test.com', 'asdf', 'asdf', 'asdf')
+            self.assertEqual(exc_context.exception.http_status, 500)
+        # it will log the decoded body
+        self.assertEqual([
+            mock.call('REQ: %s', u'curl -i http://www.test.com/asdf/asdf '
+                      '-X GET -H "X-Auth-Token: ..."'),
+            mock.call('RESP STATUS: %s %s', 500, 'Fake'),
+            mock.call('RESP HEADERS: %s', {'content-encoding': 'gzip'}),
+            mock.call('RESP BODY: %s', decoded_body)
+        ], mock_log.mock_calls)
 
     def test_redact_token(self):
         with mock.patch('swiftclient.client.logger.debug') as mock_log:
@@ -2555,6 +2948,84 @@ class TestServiceToken(MockHttpTest):
         self.assertEqual('service_key', auth_args['key'])
         self.assertEqual('service_project_name',
                          auth_kwargs['os_options']['tenant_name'])
+
+    def test_service_token_reauth_retries_0(self):
+        get_auth_call_list = []
+
+        def get_auth(url, user, key, **kwargs):
+            # The real get_auth function will always return the os_option
+            # dict's object_storage_url which will be overridden by the
+            # preauthurl parameter to Connection if it is provided.
+            args = {'url': url, 'user': user, 'key': key, 'kwargs': kwargs}
+            get_auth_call_list.append(args)
+            return_dict = {'asdf': 'new', 'service_username': 'newserv'}
+            storage_url = kwargs['os_options'].get('object_storage_url')
+            return storage_url, return_dict[user]
+
+        def swap_sleep(*args):
+            self.swap_sleep_called = True
+            c.get_auth = get_auth
+
+        with mock.patch('swiftclient.client.http_connection',
+                        self.fake_http_connection(401, 200)):
+            with mock.patch('swiftclient.client.sleep', swap_sleep):
+                self.swap_sleep_called = False
+
+                conn = c.Connection('http://www.test.com', 'asdf', 'asdf',
+                                    preauthurl='http://www.old.com',
+                                    preauthtoken='old',
+                                    os_options=self.os_options,
+                                    retries=0)
+
+                self.assertEqual(conn.attempts, 0)
+                self.assertEqual(conn.url, 'http://www.old.com')
+                self.assertEqual(conn.token, 'old')
+
+                conn.head_account()
+
+        self.assertTrue(self.swap_sleep_called)
+        self.assertEqual(conn.attempts, 2)
+        # The original 'preauth' storage URL *must* be preserved
+        self.assertEqual(conn.url, 'http://www.old.com')
+        self.assertEqual(conn.token, 'new')
+        self.assertEqual(conn.service_token, 'newserv')
+
+        # Check get_auth was called with expected args
+        auth_args = get_auth_call_list[0]
+        auth_kwargs = get_auth_call_list[0]['kwargs']
+        self.assertEqual('asdf', auth_args['user'])
+        self.assertEqual('asdf', auth_args['key'])
+        self.assertEqual('service_key',
+                         auth_kwargs['os_options']['service_key'])
+        self.assertEqual('service_username',
+                         auth_kwargs['os_options']['service_username'])
+        self.assertEqual('service_project_name',
+                         auth_kwargs['os_options']['service_project_name'])
+
+        auth_args = get_auth_call_list[1]
+        auth_kwargs = get_auth_call_list[1]['kwargs']
+        self.assertEqual('service_username', auth_args['user'])
+        self.assertEqual('service_key', auth_args['key'])
+        self.assertEqual('service_project_name',
+                         auth_kwargs['os_options']['tenant_name'])
+
+        # Ensure this is not an endless loop - it fails after the second 401
+        with mock.patch('swiftclient.client.http_connection',
+                        self.fake_http_connection(401, 401, 401, 401)):
+            with mock.patch('swiftclient.client.sleep', swap_sleep):
+                self.swap_sleep_called = False
+
+                conn = c.Connection('http://www.test.com', 'asdf', 'asdf',
+                                    preauthurl='http://www.old.com',
+                                    preauthtoken='old',
+                                    os_options=self.os_options,
+                                    retries=0)
+
+                self.assertEqual(conn.attempts, 0)
+                self.assertRaises(c.ClientException, conn.head_account)
+                self.assertEqual(conn.attempts, 2)
+                unused_responses = list(self.fake_connect.code_iter)
+                self.assertEqual(unused_responses, [401, 401])
 
     def test_service_token_get_account(self):
         with mock.patch('swiftclient.client.http_connection',
@@ -2763,7 +3234,7 @@ class TestServiceToken(MockHttpTest):
         with mock.patch('swiftclient.client.http_connection',
                         self.fake_http_connection(202)):
             conn = self.get_connection()
-            conn.delete_object('container1', 'obj1', 'a_string')
+            conn.delete_object('container1', 'obj1', query_string='a_string')
         self.assertEqual(1, len(self.request_log), self.request_log)
         for actual in self.iter_request_log():
             self.assertEqual('DELETE', actual['method'])

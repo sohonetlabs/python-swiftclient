@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Miscellaneous utility functions for use with Swift."""
+from calendar import timegm
+import collections
+import gzip
 import hashlib
 import hmac
 import json
@@ -23,6 +26,10 @@ import traceback
 
 TRUE_VALUES = set(('true', '1', 'yes', 'on', 't', 'y'))
 EMPTY_ETAG = 'd41d8cd98f00b204e9800998ecf8427e'
+EXPIRES_ISO8601_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
+SHORT_EXPIRES_ISO8601_FORMAT = '%Y-%m-%d'
+TIME_ERRMSG = ('time must either be a whole number or in specific '
+               'ISO 8601 format.')
 
 
 def config_true_value(value):
@@ -61,32 +68,82 @@ def prt_bytes(num_bytes, human_flag):
         return '%.1f%s' % (num, suffix)
 
 
-def generate_temp_url(path, seconds, key, method, absolute=False):
+def generate_temp_url(path, seconds, key, method, absolute=False,
+                      prefix=False, iso8601=False):
     """Generates a temporary URL that gives unauthenticated access to the
     Swift object.
 
-    :param path: The full path to the Swift object. Example:
-        /v1/AUTH_account/c/o.
-    :param seconds: The amount of time in seconds the temporary URL will
-        be valid for.
+    :param path: The full path to the Swift object or prefix if
+         a prefix-based temporary URL should be generated. Example:
+        /v1/AUTH_account/c/o or /v1/AUTH_account/c/prefix.
+    :param seconds: time in seconds or ISO 8601 timestamp.
+        If absolute is False and this is the string representation of an
+        integer, then this specifies the amount of time in seconds for which
+        the temporary URL will be valid.
+        If absolute is True then this specifies an absolute time at which the
+        temporary URL will expire.
     :param key: The secret temporary URL key set on the Swift
         cluster. To set a key, run 'swift post -m
         "Temp-URL-Key: <substitute tempurl key here>"'
     :param method: A HTTP method, typically either GET or PUT, to allow
         for this temporary URL.
-    :raises: ValueError if seconds is not a positive integer
-    :raises: TypeError if seconds is not an integer
+    :param absolute: if True then the seconds parameter is interpreted as a
+        Unix timestamp, if seconds represents an integer.
+    :param prefix: if True then a prefix-based temporary URL will be generated.
+    :param iso8601: if True, a URL containing an ISO 8601 UTC timestamp
+        instead of a UNIX timestamp will be created.
+    :raises ValueError: if timestamp or path is not in valid format.
     :return: the path portion of a temporary URL
     """
-    if seconds < 0:
-        raise ValueError('seconds must be a positive integer')
     try:
-        if not absolute:
-            expiration = int(time.time() + seconds)
+        try:
+            timestamp = float(seconds)
+        except ValueError:
+            formats = (
+                EXPIRES_ISO8601_FORMAT,
+                EXPIRES_ISO8601_FORMAT[:-1],
+                SHORT_EXPIRES_ISO8601_FORMAT)
+            for f in formats:
+                try:
+                    t = time.strptime(seconds, f)
+                except ValueError:
+                    t = None
+                else:
+                    if f == EXPIRES_ISO8601_FORMAT:
+                        timestamp = timegm(t)
+                    else:
+                        # Use local time if UTC designator is missing.
+                        timestamp = int(time.mktime(t))
+
+                    absolute = True
+                    break
+
+            if t is None:
+                raise ValueError()
         else:
-            expiration = int(seconds)
-    except TypeError:
-        raise TypeError('seconds must be an integer')
+            if not timestamp.is_integer():
+                raise ValueError()
+            timestamp = int(timestamp)
+            if timestamp < 0:
+                raise ValueError()
+    except ValueError:
+        raise ValueError(TIME_ERRMSG)
+
+    if isinstance(path, six.binary_type):
+        try:
+            path_for_body = path.decode('utf-8')
+        except UnicodeDecodeError:
+            raise ValueError('path must be representable as UTF-8')
+    else:
+        path_for_body = path
+
+    parts = path_for_body.split('/', 4)
+    if len(parts) != 5 or parts[0] or not all(parts[1:(4 if prefix else 5)]):
+        if prefix:
+            raise ValueError('path must at least contain /v1/a/c/')
+        else:
+            raise ValueError('path must be full path to an object'
+                             ' e.g. /v1/a/c/o')
 
     standard_methods = ['GET', 'PUT', 'HEAD', 'POST', 'DELETE']
     if method.upper() not in standard_methods:
@@ -94,21 +151,43 @@ def generate_temp_url(path, seconds, key, method, absolute=False):
         logger.warning('Non default HTTP method %s for tempurl specified, '
                        'possibly an error', method.upper())
 
-    hmac_body = '\n'.join([method.upper(), str(expiration), path])
+    if not absolute:
+        expiration = int(time.time() + timestamp)
+    else:
+        expiration = timestamp
+    hmac_body = u'\n'.join([method.upper(), str(expiration),
+                            ('prefix:' if prefix else '') + path_for_body])
 
     # Encode to UTF-8 for py3 compatibility
-    sig = hmac.new(key.encode(),
-                   hmac_body.encode(),
-                   hashlib.sha1).hexdigest()
+    if not isinstance(key, six.binary_type):
+        key = key.encode('utf-8')
+    sig = hmac.new(key, hmac_body.encode('utf-8'), hashlib.sha1).hexdigest()
 
-    return ('{path}?temp_url_sig='
-            '{sig}&temp_url_expires={exp}'.format(
-                path=path,
-                sig=sig,
-                exp=expiration))
+    if iso8601:
+        expiration = time.strftime(
+            EXPIRES_ISO8601_FORMAT, time.gmtime(expiration))
+
+    temp_url = u'{path}?temp_url_sig={sig}&temp_url_expires={exp}'.format(
+        path=path_for_body, sig=sig, exp=expiration)
+    if prefix:
+        temp_url += u'&temp_url_prefix={}'.format(parts[4])
+    # Have return type match path from caller
+    if isinstance(path, six.binary_type):
+        return temp_url.encode('utf-8')
+    else:
+        return temp_url
+
+
+def get_body(headers, body):
+    if headers.get('content-encoding') == 'gzip':
+        with gzip.GzipFile(fileobj=six.BytesIO(body), mode='r') as gz:
+            nbody = gz.read()
+        return nbody
+    return body
 
 
 def parse_api_response(headers, body):
+    body = get_body(headers, body)
     charset = 'utf-8'
     # Swift *should* be speaking UTF-8, but check content-type just in case
     content_type = headers.get('content-type', '')
@@ -116,6 +195,29 @@ def parse_api_response(headers, body):
         charset = content_type.split('; charset=', 1)[1].split(';', 1)[0]
 
     return json.loads(body.decode(charset))
+
+
+def split_request_headers(options, prefix=''):
+    headers = {}
+    if isinstance(options, collections.Mapping):
+        options = options.items()
+    for item in options:
+        if isinstance(item, six.string_types):
+            if ':' not in item:
+                raise ValueError(
+                    "Metadata parameter %s must contain a ':'.\n"
+                    "Example: 'Color:Blue' or 'Size:Large'"
+                    % item
+                )
+            item = item.split(':', 1)
+        if len(item) != 2:
+            raise ValueError(
+                "Metadata parameter %r must have exactly two items.\n"
+                "Example: ('Color', 'Blue') or ['Size', 'Large']"
+                % (item, )
+            )
+        headers[(prefix + item[0]).title()] = item[1].strip()
+    return headers
 
 
 def report_traceback():
