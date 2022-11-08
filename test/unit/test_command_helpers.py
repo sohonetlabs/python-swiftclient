@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
-from six import StringIO
+from io import StringIO
 import unittest
+from unittest import mock
 
 from swiftclient import command_helpers as h
 from swiftclient.multithreading import OutputManager

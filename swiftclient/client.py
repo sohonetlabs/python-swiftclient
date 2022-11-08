@@ -18,20 +18,18 @@ OpenStack Swift client library used internally
 """
 import socket
 import re
-import requests
 import logging
 import warnings
 
-from distutils.version import StrictVersion
 from requests.exceptions import RequestException, SSLError
-from six.moves import http_client
-from six.moves.urllib.parse import quote as _quote, unquote
-from six.moves.urllib.parse import urljoin, urlparse, urlunparse
+import http.client as http_client
+from urllib.parse import quote, unquote
+from urllib.parse import urljoin, urlparse, urlunparse
 from time import sleep, time
-import six
 
 from swiftclient import version as swiftclient_version
 from swiftclient.exceptions import ClientException
+from swiftclient.requests_compat import SwiftClientRequestsSession
 from swiftclient.utils import (
     iter_wrapper, LengthWrapper, ReadableToIterable, parse_api_response,
     get_body)
@@ -39,41 +37,33 @@ from swiftclient.utils import (
 # Default is 100, increase to 256
 http_client._MAXHEADERS = 256
 
-VERSIONFUL_AUTH_PATH = re.compile('v[2-3](?:\.0)?$')
+VERSIONFUL_AUTH_PATH = re.compile(r'v[2-3](?:\.0)?$')
 AUTH_VERSIONS_V1 = ('1.0', '1', 1)
 AUTH_VERSIONS_V2 = ('2.0', '2', 2)
 AUTH_VERSIONS_V3 = ('3.0', '3', 3)
 USER_METADATA_TYPE = tuple('x-%s-meta-' % type_ for type_ in
                            ('container', 'account', 'object'))
+URI_PATTERN_INFO = re.compile(r'/info')
+URI_PATTERN_VERSION = re.compile(r'\/v\d+\.?\d*(\/.*)?')
 
+ksexceptions = ksclient_v2 = ksclient_v3 = ksa_v3 = None
 try:
-    from logging import NullHandler
+    from keystoneclient import exceptions as ksexceptions
+    # prevent keystoneclient warning us that it has no log handlers
+    logging.getLogger('keystoneclient').addHandler(logging.NullHandler())
+    from keystoneclient.v2_0 import client as ksclient_v2
 except ImportError:
-    # Added in Python 2.7
-    class NullHandler(logging.Handler):
-        def handle(self, record):
-            pass
-
-        def emit(self, record):
-            pass
-
-        def createLock(self):
-            self.lock = None
-
-# requests version 1.2.3 try to encode headers in ascii, preventing
-# utf-8 encoded header to be 'prepared'
-if StrictVersion(requests.__version__) < StrictVersion('2.0.0'):
-    from requests.structures import CaseInsensitiveDict
-
-    def prepare_unicode_headers(self, headers):
-        if headers:
-            self.headers = CaseInsensitiveDict(headers)
-        else:
-            self.headers = CaseInsensitiveDict()
-    requests.models.PreparedRequest.prepare_headers = prepare_unicode_headers
+    pass
+try:
+    from keystoneclient.v3 import client as ksclient_v3
+    from keystoneauth1.identity import v3 as ksa_v3
+    from keystoneauth1 import session as ksa_session
+    from keystoneauth1 import exceptions as ksauthexceptions
+except ImportError:
+    pass
 
 logger = logging.getLogger("swiftclient")
-logger.addHandler(NullHandler())
+logger.addHandler(logging.NullHandler())
 
 #: Default behaviour is to redact header values known to contain secrets,
 #: such as ``X-Auth-Key`` and ``X-Auth-Token``. Up to the first 16 chars
@@ -151,7 +141,7 @@ def http_log(args, kwargs, resp, body):
         elif element in ('GET', 'POST', 'PUT'):
             string_parts.append(' -X %s' % element)
         else:
-            string_parts.append(' %s' % element)
+            string_parts.append(' %s' % parse_header_string(element))
     if 'headers' in kwargs:
         headers = scrub_headers(kwargs['headers'])
         for element in headers:
@@ -174,56 +164,32 @@ def http_log(args, kwargs, resp, body):
 
 
 def parse_header_string(data):
-    if not isinstance(data, (six.text_type, six.binary_type)):
+    if not isinstance(data, (str, bytes)):
         data = str(data)
-    if six.PY2:
-        if isinstance(data, six.text_type):
-            # Under Python2 requests only returns binary_type, but if we get
-            # some stray text_type input, this should prevent unquote from
-            # interpreting %-encoded data as raw code-points.
-            data = data.encode('utf8')
+    if isinstance(data, bytes):
+        # Under Python3 requests only returns text_type and tosses (!) the
+        # rest of the headers. If that ever changes, this should be a sane
+        # approach.
         try:
-            unquoted = unquote(data).decode('utf8')
+            data = data.decode('ascii')
         except UnicodeDecodeError:
-            try:
-                return data.decode('utf8')
-            except UnicodeDecodeError:
-                return quote(data).decode('utf8')
-    else:
-        if isinstance(data, six.binary_type):
-            # Under Python3 requests only returns text_type and tosses (!) the
-            # rest of the headers. If that ever changes, this should be a sane
-            # approach.
-            try:
-                data = data.decode('ascii')
-            except UnicodeDecodeError:
-                data = quote(data)
-        try:
-            unquoted = unquote(data, errors='strict')
-        except UnicodeDecodeError:
-            return data
+            data = quote(data)
+    try:
+        unquoted = unquote(data, errors='strict')
+    except UnicodeDecodeError:
+        return data
     return unquoted
 
 
-def quote(value, safe='/'):
-    """
-    Patched version of urllib.quote that encodes utf8 strings before quoting.
-    On Python 3, call directly urllib.parse.quote().
-    """
-    if six.PY3:
-        return _quote(value, safe=safe)
-    return _quote(encode_utf8(value), safe)
-
-
 def encode_utf8(value):
-    if type(value) in six.integer_types + (float, bool):
+    if type(value) in (int, float, bool):
         # As of requests 2.11.0, headers must be byte- or unicode-strings.
         # Convert some known-good types as a convenience for developers.
         # Note that we *don't* convert subclasses, as they may have overriddden
         # __str__ or __repr__.
         # See https://github.com/kennethreitz/requests/pull/3366 for more info
         value = str(value)
-    if isinstance(value, six.text_type):
+    if isinstance(value, str):
         value = value.encode('utf8')
     return value
 
@@ -235,20 +201,20 @@ def encode_meta_headers(headers):
         value = encode_utf8(value)
         header = header.lower()
 
-        if (isinstance(header, six.string_types)
-                and header.startswith(USER_METADATA_TYPE)):
+        if (isinstance(header, str) and
+                header.startswith(USER_METADATA_TYPE)):
             header = encode_utf8(header)
 
         ret[header] = value
     return ret
 
 
-class _ObjectBody(object):
+class _ObjectBody:
     """
     Readable and iterable object body response wrapper.
     """
 
-    def __init__(self, resp, chunk_size):
+    def __init__(self, resp, chunk_size, conn_to_close):
         """
         Wrap the underlying response
 
@@ -257,9 +223,13 @@ class _ObjectBody(object):
         """
         self.resp = resp
         self.chunk_size = chunk_size
+        self.conn_to_close = conn_to_close
 
     def read(self, length=None):
-        return self.resp.read(length)
+        buf = self.resp.read(length)
+        if length != 0 and not buf:
+            self.close()
+        return buf
 
     def __iter__(self):
         return self
@@ -272,6 +242,11 @@ class _ObjectBody(object):
 
     def __next__(self):
         return self.next()
+
+    def close(self):
+        self.resp.close()
+        if self.conn_to_close:
+            self.conn_to_close.close()
 
 
 class _RetryBody(_ObjectBody):
@@ -297,14 +272,14 @@ class _RetryBody(_ObjectBody):
         :param headers: an optional dictionary with additional headers to
                          include in the request
         """
-        super(_RetryBody, self).__init__(resp, resp_chunk_size)
+        super(_RetryBody, self).__init__(resp, resp_chunk_size, None)
         self.expected_length = int(self.resp.getheader('Content-Length'))
         self.conn = connection
         self.container = container
         self.obj = obj
         self.query_string = query_string
         self.response_dict = response_dict
-        self.headers = headers if headers is not None else {}
+        self.headers = dict(headers) if headers is not None else {}
         self.bytes_read = 0
 
     def read(self, length=None):
@@ -348,7 +323,7 @@ class _RetryBody(_ObjectBody):
         return buf
 
 
-class HTTPConnection(object):
+class HTTPConnection:
     def __init__(self, url, proxy=None, cacert=None, insecure=False,
                  cert=None, cert_key=None, ssl_compression=False,
                  default_user_agent=None, timeout=None):
@@ -383,9 +358,10 @@ class HTTPConnection(object):
         self.host = self.parsed_url.netloc
         self.port = self.parsed_url.port
         self.requests_args = {}
-        self.request_session = requests.Session()
+        self.request_session = SwiftClientRequestsSession()
         # Don't use requests's default headers
         self.request_session.headers = None
+        self.resp = None
         if self.parsed_url.scheme not in ('http', 'https'):
             raise ClientException('Unsupported scheme "%s" in url "%s"'
                                   % (self.parsed_url.scheme, url))
@@ -455,11 +431,23 @@ class HTTPConnection(object):
         self.resp.status = self.resp.status_code
         old_getheader = self.resp.raw.getheader
 
+        def _decode_header(string):
+            if string is None:
+                return string
+            return string.encode('iso-8859-1').decode('utf-8')
+
+        def _encode_header(string):
+            if string is None:
+                return string
+            return string.encode('utf-8').decode('iso-8859-1')
+
         def getheaders():
-            return self.resp.headers.items()
+            return [(_decode_header(k), _decode_header(v))
+                    for k, v in self.resp.headers.items()]
 
         def getheader(k, v=None):
-            return old_getheader(k.lower(), v)
+            return _decode_header(old_getheader(
+                _encode_header(k.lower()), _encode_header(v)))
 
         def releasing_read(*args, **kwargs):
             chunk = self.resp.raw.read(*args, **kwargs)
@@ -468,7 +456,7 @@ class HTTPConnection(object):
                 # urllib3's connection pool. This will reduce the number of
                 # log messages seen in bug #1341777. This does not actually
                 # close a socket. It will also prevent people from being
-                # mislead as to the cause of a bug as in bug #1424732.
+                # misled as to the cause of a bug as in bug #1424732.
                 self.resp.close()
             return chunk
 
@@ -477,6 +465,11 @@ class HTTPConnection(object):
         self.resp.read = releasing_read
 
         return self.resp
+
+    def close(self):
+        if self.resp:
+            self.resp.close()
+        self.request_session.close()
 
 
 def http_connection(*arg, **kwarg):
@@ -499,6 +492,8 @@ def get_auth_1_0(url, user, key, snet, **kwargs):
     conn.request(method, parsed.path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
+    resp.close()
+    conn.close()
     http_log((url, method,), headers, resp, body)
     url = resp.getheader('x-storage-url')
 
@@ -513,8 +508,9 @@ def get_auth_1_0(url, user, key, snet, **kwargs):
         netloc = parsed[1]
         parsed[1] = 'snet-' + netloc
         url = urlunparse(parsed)
-    return url, resp.getheader('x-storage-token',
-                               resp.getheader('x-auth-token'))
+
+    token = resp.getheader('x-storage-token', resp.getheader('x-auth-token'))
+    return url, token
 
 
 def get_keystoneclient_2_0(auth_url, user, key, os_options, **kwargs):
@@ -522,25 +518,6 @@ def get_keystoneclient_2_0(auth_url, user, key, os_options, **kwargs):
     # interface of this module
     kwargs.update({'auth_version': '2.0'})
     return get_auth_keystone(auth_url, user, key, os_options, **kwargs)
-
-
-def _import_keystone_client(auth_version):
-    # the attempted imports are encapsulated in this function to allow
-    # mocking for tests
-    try:
-        if auth_version in AUTH_VERSIONS_V3:
-            from keystoneclient.v3 import client as ksclient
-        else:
-            from keystoneclient.v2_0 import client as ksclient
-        from keystoneclient import exceptions
-        # prevent keystoneclient warning us that it has no log handlers
-        logging.getLogger('keystoneclient').addHandler(NullHandler())
-        return ksclient, exceptions
-    except ImportError:
-        raise ClientException('''
-Auth versions 2.0 and 3 require python-keystoneclient, install it or use Auth
-version 1.0 which requires ST_AUTH, ST_USER, and ST_KEY environment
-variables to be set or overridden with -A, -U, or -K.''')
 
 
 def get_auth_keystone(auth_url, user, key, os_options, **kwargs):
@@ -571,7 +548,65 @@ def get_auth_keystone(auth_url, user, key, os_options, **kwargs):
     # Legacy default if not set
     if auth_version is None:
         auth_version = '2'
-    ksclient, exceptions = _import_keystone_client(auth_version)
+
+    ksclient = None
+    if auth_version in AUTH_VERSIONS_V3:
+        if ksclient_v3 is not None:
+            ksclient = ksclient_v3
+    else:
+        if ksclient_v2 is not None:
+            ksclient = ksclient_v2
+
+    if ksclient is None:
+        raise ClientException('''
+Auth versions 2.0 and 3 require python-keystoneclient, install it or use Auth
+version 1.0 which requires ST_AUTH, ST_USER, and ST_KEY environment
+variables to be set or overridden with -A, -U, or -K.''')
+
+    filter_kwargs = {}
+    service_type = os_options.get('service_type') or 'object-store'
+    endpoint_type = os_options.get('endpoint_type') or 'publicURL'
+    if os_options.get('region_name'):
+        filter_kwargs['attr'] = 'region'
+        filter_kwargs['filter_value'] = os_options['region_name']
+
+    if os_options.get('auth_type') and os_options['auth_type'] not in (
+            'password', 'v2password', 'v3password',
+            'v3applicationcredential'):
+        raise ClientException(
+            'Swiftclient currently only supports v3applicationcredential '
+            'for auth_type')
+    elif os_options.get('auth_type') == 'v3applicationcredential':
+        if ksa_v3 is None:
+            raise ClientException('Auth v3applicationcredential requires '
+                                  'keystoneauth1 package; consider upgrading '
+                                  'to python-keystoneclient>=2.0.0')
+
+        try:
+            auth = ksa_v3.ApplicationCredential(
+                auth_url=auth_url,
+                application_credential_secret=os_options.get(
+                    'application_credential_secret'),
+                application_credential_id=os_options.get(
+                    'application_credential_id'))
+            sess = ksa_session.Session(auth=auth)
+            token = sess.get_token()
+        except ksauthexceptions.Unauthorized:
+            msg = 'Unauthorized. Check application credential id and secret.'
+            raise ClientException(msg)
+        except ksauthexceptions.AuthorizationFailure as err:
+            raise ClientException('Authorization Failure. %s' % err)
+
+        try:
+            endpoint = sess.get_endpoint_data(service_type=service_type,
+                                              endpoint_type=endpoint_type,
+                                              **filter_kwargs)
+
+            return endpoint.catalog_url, token
+        except ksauthexceptions.EndpointNotFound:
+            raise ClientException(
+                'Endpoint for %s not found - '
+                'have you specified a region?' % service_type)
 
     try:
         _ksclient = ksclient.Client(
@@ -592,26 +627,21 @@ def get_auth_keystone(auth_url, user, key, os_options, **kwargs):
             cert=kwargs.get('cert'),
             key=kwargs.get('cert_key'),
             auth_url=auth_url, insecure=insecure, timeout=timeout)
-    except exceptions.Unauthorized:
+    except ksexceptions.Unauthorized:
         msg = 'Unauthorized. Check username, password and tenant name/id.'
         if auth_version in AUTH_VERSIONS_V3:
             msg = ('Unauthorized. Check username/id, password, '
                    'tenant name/id and user/tenant domain name/id.')
         raise ClientException(msg)
-    except exceptions.AuthorizationFailure as err:
+    except ksexceptions.AuthorizationFailure as err:
         raise ClientException('Authorization Failure. %s' % err)
-    service_type = os_options.get('service_type') or 'object-store'
-    endpoint_type = os_options.get('endpoint_type') or 'publicURL'
+
     try:
-        filter_kwargs = {}
-        if os_options.get('region_name'):
-            filter_kwargs['attr'] = 'region'
-            filter_kwargs['filter_value'] = os_options['region_name']
         endpoint = _ksclient.service_catalog.url_for(
             service_type=service_type,
             endpoint_type=endpoint_type,
             **filter_kwargs)
-    except exceptions.EndpointNotFound:
+    except ksexceptions.EndpointNotFound:
         raise ClientException('Endpoint for %s not found - '
                               'have you specified a region?' % service_type)
     return endpoint, _ksclient.auth_token
@@ -675,9 +705,12 @@ def get_auth(auth_url, user, key, **kwargs):
         if kwargs.get('tenant_name'):
             os_options['tenant_name'] = kwargs['tenant_name']
 
-        if not (os_options.get('tenant_name') or os_options.get('tenant_id')
-                or os_options.get('project_name')
-                or os_options.get('project_id')):
+        if os_options.get('auth_type') == 'v3applicationcredential':
+            pass
+        elif not (os_options.get('tenant_name') or
+                  os_options.get('tenant_id') or
+                  os_options.get('project_name') or
+                  os_options.get('project_id')):
             if auth_version in AUTH_VERSIONS_V2:
                 raise ClientException('No tenant specified')
             raise ClientException('No project name or project id specified.')
@@ -726,7 +759,7 @@ def store_response(resp, response_dict):
 
 def get_account(url, token, marker=None, limit=None, prefix=None,
                 end_marker=None, http_conn=None, full_listing=False,
-                service_token=None, headers=None):
+                service_token=None, headers=None, delimiter=None):
     """
     Get a listing of containers for the account.
 
@@ -742,6 +775,7 @@ def get_account(url, token, marker=None, limit=None, prefix=None,
                          of 10000 listings
     :param service_token: service auth token
     :param headers: additional headers to include in the request
+    :param delimiter: delimiter query
     :returns: a tuple of (response headers, a list of containers) The response
               headers will be a dict and all header names will be lowercase.
     :raises ClientException: HTTP GET request failed
@@ -752,17 +786,19 @@ def get_account(url, token, marker=None, limit=None, prefix=None,
     if headers:
         req_headers.update(headers)
 
+    close_conn = False
     if not http_conn:
         http_conn = http_connection(url)
+        close_conn = True
     if full_listing:
-        rv = get_account(url, token, marker, limit, prefix,
-                         end_marker, http_conn, headers=req_headers)
+        rv = get_account(url, token, marker, limit, prefix, end_marker,
+                         http_conn, headers=req_headers, delimiter=delimiter)
         listing = rv[1]
         while listing:
             marker = listing[-1]['name']
             listing = get_account(url, token, marker, limit, prefix,
-                                  end_marker, http_conn,
-                                  headers=req_headers)[1]
+                                  end_marker, http_conn, headers=req_headers,
+                                  delimiter=delimiter)[1]
             if listing:
                 rv[1].extend(listing)
         return rv
@@ -774,6 +810,8 @@ def get_account(url, token, marker=None, limit=None, prefix=None,
         qs += '&limit=%d' % limit
     if prefix:
         qs += '&prefix=%s' % quote(prefix)
+    if delimiter:
+        qs += '&delimiter=%s' % quote(delimiter)
     if end_marker:
         qs += '&end_marker=%s' % quote(end_marker)
     full_path = '%s?%s' % (parsed.path, qs)
@@ -781,6 +819,8 @@ def get_account(url, token, marker=None, limit=None, prefix=None,
     conn.request(method, full_path, '', req_headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(("%s?%s" % (url, qs), method,), {'headers': req_headers},
              resp, body)
 
@@ -807,10 +847,12 @@ def head_account(url, token, http_conn=None, headers=None,
               be lowercase)
     :raises ClientException: HTTP HEAD request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
     method = "HEAD"
     req_headers = {'X-Auth-Token': token}
     if service_token:
@@ -821,6 +863,8 @@ def head_account(url, token, http_conn=None, headers=None,
     conn.request(method, parsed.path, '', req_headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log((url, method,), {'headers': req_headers}, resp, body)
     if resp.status < 200 or resp.status >= 300:
         raise ClientException.from_response(resp, 'Account HEAD failed', body)
@@ -846,21 +890,27 @@ def post_account(url, token, headers, http_conn=None, response_dict=None,
     :raises ClientException: HTTP POST request failed
     :returns: resp_headers, body
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
     method = 'POST'
     path = parsed.path
     if query_string:
         path += '?' + query_string
-    headers['X-Auth-Token'] = token
+    req_headers = {'X-Auth-Token': token}
     if service_token:
-        headers['X-Service-Token'] = service_token
-    conn.request(method, path, data, headers)
+        req_headers['X-Service-Token'] = service_token
+    if headers:
+        req_headers.update(headers)
+    conn.request(method, path, data, req_headers)
     resp = conn.getresponse()
     body = resp.read()
-    http_log((url, method,), {'headers': headers}, resp, body)
+    if close_conn:
+        conn.close()
+    http_log((url, method,), {'headers': req_headers}, resp, body)
 
     store_response(resp, response_dict)
 
@@ -874,7 +924,7 @@ def post_account(url, token, headers, http_conn=None, response_dict=None,
 
 def get_container(url, token, container, marker=None, limit=None,
                   prefix=None, delimiter=None, end_marker=None,
-                  path=None, http_conn=None,
+                  version_marker=None, path=None, http_conn=None,
                   full_listing=False, service_token=None, headers=None,
                   query_string=None):
     """
@@ -888,6 +938,7 @@ def get_container(url, token, container, marker=None, limit=None,
     :param prefix: prefix query
     :param delimiter: string to delimit the queries on
     :param end_marker: marker query
+    :param version_marker: version marker query
     :param path: path query (equivalent: "delimiter=/" and "prefix=path/")
     :param http_conn: a tuple of (parsed url, HTTPConnection object),
                       (If None, it will create the conn object)
@@ -900,27 +951,26 @@ def get_container(url, token, container, marker=None, limit=None,
               headers will be a dict and all header names will be lowercase.
     :raises ClientException: HTTP GET request failed
     """
+    close_conn = False
     if not http_conn:
         http_conn = http_connection(url)
-    if headers:
-        headers = dict(headers)
-    else:
-        headers = {}
-    headers['X-Auth-Token'] = token
-    headers['Accept-Encoding'] = 'gzip'
+        close_conn = True
     if full_listing:
         rv = get_container(url, token, container, marker, limit, prefix,
-                           delimiter, end_marker, path, http_conn,
-                           service_token=service_token, headers=headers)
+                           delimiter, end_marker, version_marker, path=path,
+                           http_conn=http_conn, service_token=service_token,
+                           headers=headers)
         listing = rv[1]
         while listing:
             if not delimiter:
                 marker = listing[-1]['name']
             else:
                 marker = listing[-1].get('name', listing[-1].get('subdir'))
+            version_marker = listing[-1].get('version_id')
             listing = get_container(url, token, container, marker, limit,
-                                    prefix, delimiter, end_marker, path,
-                                    http_conn, service_token=service_token,
+                                    prefix, delimiter, end_marker,
+                                    version_marker, path, http_conn,
+                                    service_token=service_token,
                                     headers=headers)[1]
             if listing:
                 rv[1].extend(listing)
@@ -938,21 +988,28 @@ def get_container(url, token, container, marker=None, limit=None,
         qs += '&delimiter=%s' % quote(delimiter)
     if end_marker:
         qs += '&end_marker=%s' % quote(end_marker)
+    if version_marker:
+        qs += '&version_marker=%s' % quote(version_marker)
     if path:
         qs += '&path=%s' % quote(path)
     if query_string:
         qs += '&%s' % query_string.lstrip('?')
+    req_headers = {'X-Auth-Token': token, 'Accept-Encoding': 'gzip'}
     if service_token:
-        headers['X-Service-Token'] = service_token
+        req_headers['X-Service-Token'] = service_token
+    if headers:
+        req_headers.update(headers)
     method = 'GET'
-    conn.request(method, '%s?%s' % (cont_path, qs), '', headers)
+    conn.request(method, '%s?%s' % (cont_path, qs), '', req_headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(('%(url)s%(cont_path)s?%(qs)s' %
               {'url': url.replace(parsed.path, ''),
                'cont_path': cont_path,
                'qs': qs}, method,),
-             {'headers': headers}, resp, body)
+             {'headers': req_headers}, resp, body)
 
     if resp.status < 200 or resp.status >= 300:
         raise ClientException.from_response(resp, 'Container GET failed', body)
@@ -978,10 +1035,12 @@ def head_container(url, token, container, http_conn=None, headers=None,
               be lowercase)
     :raises ClientException: HTTP HEAD request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
     path = '%s/%s' % (parsed.path, quote(container))
     method = 'HEAD'
     req_headers = {'X-Auth-Token': token}
@@ -992,6 +1051,8 @@ def head_container(url, token, container, http_conn=None, headers=None,
     conn.request(method, path, '', req_headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), method,),
              {'headers': req_headers}, resp, body)
 
@@ -1019,29 +1080,33 @@ def put_container(url, token, container, headers=None, http_conn=None,
     :param query_string: if set will be appended with '?' to generated path
     :raises ClientException: HTTP PUT request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
     path = '%s/%s' % (parsed.path, quote(container))
     method = 'PUT'
-    if not headers:
-        headers = {}
-    headers['X-Auth-Token'] = token
+    req_headers = {'X-Auth-Token': token}
     if service_token:
-        headers['X-Service-Token'] = service_token
-    if 'content-length' not in (k.lower() for k in headers):
-        headers['Content-Length'] = '0'
+        req_headers['X-Service-Token'] = service_token
+    if headers:
+        req_headers.update(headers)
+    if 'content-length' not in (k.lower() for k in req_headers):
+        req_headers['Content-Length'] = '0'
     if query_string:
         path += '?' + query_string.lstrip('?')
-    conn.request(method, path, '', headers)
+    conn.request(method, path, '', req_headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
 
     store_response(resp, response_dict)
 
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), method,),
-             {'headers': headers}, resp, body)
+             {'headers': req_headers}, resp, body)
     if resp.status < 200 or resp.status >= 300:
         raise ClientException.from_response(resp, 'Container PUT failed', body)
 
@@ -1062,22 +1127,28 @@ def post_container(url, token, container, headers, http_conn=None,
     :param service_token: service auth token
     :raises ClientException: HTTP POST request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
     path = '%s/%s' % (parsed.path, quote(container))
     method = 'POST'
-    headers['X-Auth-Token'] = token
+    req_headers = {'X-Auth-Token': token}
     if service_token:
-        headers['X-Service-Token'] = service_token
+        req_headers['X-Service-Token'] = service_token
+    if headers:
+        req_headers.update(headers)
     if 'content-length' not in (k.lower() for k in headers):
-        headers['Content-Length'] = '0'
-    conn.request(method, path, '', headers)
+        req_headers['Content-Length'] = '0'
+    conn.request(method, path, '', req_headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), method,),
-             {'headers': headers}, resp, body)
+             {'headers': req_headers}, resp, body)
 
     store_response(resp, response_dict)
 
@@ -1104,10 +1175,12 @@ def delete_container(url, token, container, http_conn=None,
     :param headers: additional headers to include in the request
     :raises ClientException: HTTP DELETE request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
     path = '%s/%s' % (parsed.path, quote(container))
     if headers:
         headers = dict(headers)
@@ -1123,6 +1196,8 @@ def delete_container(url, token, container, http_conn=None,
     conn.request(method, path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), method,),
              {'headers': headers}, resp, body)
 
@@ -1144,7 +1219,8 @@ def get_object(url, token, container, name, http_conn=None,
     :param container: container name that the object is in
     :param name: object name to get
     :param http_conn: a tuple of (parsed url, HTTPConnection object),
-                      (If None, it will create the conn object)
+                      (If None, it will create the conn object and close it
+                      after all content is read)
     :param resp_chunk_size: if defined, chunk size of data to read. NOTE: If
                             you specify a resp_chunk_size you must fully read
                             the object's contents before making another
@@ -1159,10 +1235,12 @@ def get_object(url, token, container, name, http_conn=None,
               headers will be a dict and all header names will be lowercase.
     :raises ClientException: HTTP GET request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
     path = '%s/%s/%s' % (parsed.path, quote(container), quote(name))
     if query_string:
         path += '?' + query_string
@@ -1185,9 +1263,12 @@ def get_object(url, token, container, name, http_conn=None,
                  {'headers': headers}, resp, body)
         raise ClientException.from_response(resp, 'Object GET failed', body)
     if resp_chunk_size:
-        object_body = _ObjectBody(resp, resp_chunk_size)
+        object_body = _ObjectBody(resp, resp_chunk_size,
+                                  conn_to_close=conn if close_conn else None)
     else:
         object_body = resp.read()
+        if close_conn:
+            conn.close()
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), method,),
              {'headers': headers}, resp, None)
 
@@ -1211,10 +1292,12 @@ def head_object(url, token, container, name, http_conn=None,
               be lowercase)
     :raises ClientException: HTTP HEAD request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
     path = '%s/%s/%s' % (parsed.path, quote(container), quote(name))
     if query_string:
         path += '?' + query_string
@@ -1229,6 +1312,8 @@ def head_object(url, token, container, name, http_conn=None,
     conn.request(method, path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), method,),
              {'headers': headers}, resp, body)
     if resp.status < 200 or resp.status >= 300:
@@ -1278,10 +1363,12 @@ def put_object(url, token=None, container=None, name=None, contents=None,
     :returns: etag
     :raises ClientException: HTTP PUT request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url, proxy=proxy)
+        close_conn = True
     path = parsed.path
     if container:
         path = '%s/%s' % (path.rstrip('/'), quote(container))
@@ -1307,11 +1394,6 @@ def put_object(url, token=None, container=None, name=None, contents=None,
                 content_length = int(v)
     if content_type is not None:
         headers['Content-Type'] = content_type
-    elif 'Content-Type' not in headers:
-        if StrictVersion(requests.__version__) < StrictVersion('2.4.0'):
-            # python-requests sets application/x-www-form-urlencoded otherwise
-            # if using python3.
-            headers['Content-Type'] = ''
     if not contents:
         headers['Content-Length'] = '0'
 
@@ -1334,12 +1416,14 @@ def put_object(url, token=None, container=None, name=None, contents=None,
             warnings.warn(warn_msg, stacklevel=2)
         # Match requests's is_stream test
         if hasattr(contents, '__iter__') and not isinstance(contents, (
-                six.text_type, six.binary_type, list, tuple, dict)):
+                str, bytes, list, tuple, dict)):
             contents = iter_wrapper(contents)
         conn.request('PUT', path, contents, headers)
 
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), 'PUT',),
              {'headers': headers}, resp, body)
 
@@ -1369,19 +1453,25 @@ def post_object(url, token, container, name, headers, http_conn=None,
     :param service_token: service auth token
     :raises ClientException: HTTP POST request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
     path = '%s/%s/%s' % (parsed.path, quote(container), quote(name))
-    headers['X-Auth-Token'] = token
+    req_headers = {'X-Auth-Token': token}
     if service_token:
-        headers['X-Service-Token'] = service_token
-    conn.request('POST', path, '', headers)
+        req_headers['X-Service-Token'] = service_token
+    if headers:
+        req_headers.update(headers)
+    conn.request('POST', path, '', req_headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), 'POST',),
-             {'headers': headers}, resp, body)
+             {'headers': req_headers}, resp, body)
 
     store_response(resp, response_dict)
 
@@ -1412,10 +1502,12 @@ def copy_object(url, token, container, name, destination=None,
     :param service_token: service auth token
     :raises ClientException: HTTP COPY request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url)
+        close_conn = True
 
     path = parsed.path
     container = quote(container)
@@ -1444,6 +1536,8 @@ def copy_object(url, token, container, name, destination=None,
     conn.request('COPY', path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), 'COPY',),
              {'headers': headers}, resp, body)
 
@@ -1476,10 +1570,12 @@ def delete_object(url, token=None, container=None, name=None, http_conn=None,
     :param service_token: service auth token
     :raises ClientException: HTTP DELETE request failed
     """
+    close_conn = False
     if http_conn:
         parsed, conn = http_conn
     else:
         parsed, conn = http_connection(url, proxy=proxy)
+        close_conn = True
     path = parsed.path
     if container:
         path = '%s/%s' % (path.rstrip('/'), quote(container))
@@ -1498,6 +1594,8 @@ def delete_object(url, token=None, container=None, name=None, http_conn=None,
     conn.request('DELETE', path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
+    if close_conn:
+        conn.close()
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), 'DELETE',),
              {'headers': headers}, resp, body)
 
@@ -1528,7 +1626,7 @@ def get_capabilities(http_conn):
     return parse_api_response(resp_headers, body)
 
 
-class Connection(object):
+class Connection:
 
     """
     Convenience class to make requests that will also retry the request
@@ -1548,7 +1646,7 @@ class Connection(object):
                  starting_backoff=1, max_backoff=64, tenant_name=None,
                  os_options=None, auth_version="1", cacert=None,
                  insecure=False, cert=None, cert_key=None,
-                 ssl_compression=True, retry_on_ratelimit=False,
+                 ssl_compression=True, retry_on_ratelimit=True,
                  timeout=None, session=None, force_auth_retry=False):
         """
         :param authurl: authentication URL
@@ -1580,9 +1678,9 @@ class Connection(object):
                                 will be made. This may provide a performance
                                 increase for https upload/download operations.
         :param retry_on_ratelimit: by default, a ratelimited connection will
-                                   raise an exception to the caller. Setting
-                                   this parameter to True will cause a retry
-                                   after a backoff.
+                                   retry after a backoff. Setting this
+                                   parameter to False will cause an exception
+                                   to be raised to the caller.
         :param timeout: The connect timeout for the HTTP connection.
         :param session: A keystoneauth session object.
         :param force_auth_retry: reset auth info even if client got unexpected
@@ -1622,14 +1720,11 @@ class Connection(object):
         self.force_auth_retry = force_auth_retry
 
     def close(self):
-        if (self.http_conn and isinstance(self.http_conn, tuple)
-                and len(self.http_conn) > 1):
+        if (self.http_conn and isinstance(self.http_conn, tuple) and
+                len(self.http_conn) > 1):
             conn = self.http_conn[1]
-            if hasattr(conn, 'close') and callable(conn.close):
-                # XXX: Our HTTPConnection object has no close, should be
-                # trying to close the requests.Session here?
-                conn.close()
-                self.http_conn = None
+            conn.close()
+            self.http_conn = None
 
     def get_auth(self):
         self.url, self.token = get_auth(self.authurl, self.user, self.key,
@@ -1689,10 +1784,10 @@ class Connection(object):
             try:
                 if not self.url or not self.token:
                     self.url, self.token = self.get_auth()
-                    self.http_conn = None
+                    self.close()
                 if self.service_auth and not self.service_token:
                     self.url, self.service_token = self.get_service_auth()
-                    self.http_conn = None
+                    self.close()
                 self.auth_end_time = time()
                 if not self.http_conn:
                     self.http_conn = self.http_connection()
@@ -1730,7 +1825,7 @@ class Connection(object):
                     self.http_conn = None
                 elif 500 <= err.http_status <= 599:
                     pass
-                elif self.retry_on_ratelimit and err.http_status == 498:
+                elif self.retry_on_ratelimit and err.http_status in (498, 429):
                     pass
                 else:
                     raise
@@ -1748,14 +1843,16 @@ class Connection(object):
         return self._retry(None, head_account, headers=headers)
 
     def get_account(self, marker=None, limit=None, prefix=None,
-                    end_marker=None, full_listing=False, headers=None):
+                    end_marker=None, full_listing=False, headers=None,
+                    delimiter=None):
         """Wrapper for :func:`get_account`"""
         # TODO(unknown): With full_listing=True this will restart the entire
         # listing with each retry. Need to make a better version that just
         # retries where it left off.
         return self._retry(None, get_account, marker=marker, limit=limit,
                            prefix=prefix, end_marker=end_marker,
-                           full_listing=full_listing, headers=headers)
+                           full_listing=full_listing, headers=headers,
+                           delimiter=delimiter)
 
     def post_account(self, headers, response_dict=None,
                      query_string=None, data=None):
@@ -1769,15 +1866,17 @@ class Connection(object):
         return self._retry(None, head_container, container, headers=headers)
 
     def get_container(self, container, marker=None, limit=None, prefix=None,
-                      delimiter=None, end_marker=None, path=None,
-                      full_listing=False, headers=None, query_string=None):
+                      delimiter=None, end_marker=None, version_marker=None,
+                      path=None, full_listing=False, headers=None,
+                      query_string=None):
         """Wrapper for :func:`get_container`"""
         # TODO(unknown): With full_listing=True this will restart the entire
         # listing with each retry. Need to make a better version that just
         # retries where it left off.
         return self._retry(None, get_container, container, marker=marker,
                            limit=limit, prefix=prefix, delimiter=delimiter,
-                           end_marker=end_marker, path=path,
+                           end_marker=end_marker,
+                           version_marker=version_marker, path=path,
                            full_listing=full_listing, headers=headers,
                            query_string=query_string)
 
@@ -1849,7 +1948,9 @@ class Connection(object):
                 reset = getattr(contents, 'reset', None)
                 if tell and seek:
                     orig_pos = tell()
-                    reset_func = lambda *a, **k: seek(orig_pos)
+
+                    def reset_func(*a, **kw):
+                        seek(orig_pos)
                 elif reset:
                     reset_func = reset
         return self._retry(reset_func, put_object, container, obj, contents,
@@ -1878,12 +1979,22 @@ class Connection(object):
                            response_dict=response_dict,
                            headers=headers)
 
-    def get_capabilities(self, url=None):
+    def _map_url(self, url):
         url = url or self.url
         if not url:
             url, _ = self.get_auth()
-        scheme = urlparse(url).scheme
-        netloc = urlparse(url).netloc
-        url = scheme + '://' + netloc + '/info'
-        http_conn = self.http_connection(url)
-        return get_capabilities(http_conn)
+        scheme, netloc, path, params, query, fragment = urlparse(url)
+        if URI_PATTERN_VERSION.search(path):
+            path = URI_PATTERN_VERSION.sub('/info', path)
+        elif not URI_PATTERN_INFO.search(path):
+            if path.endswith('/'):
+                path += 'info'
+            else:
+                path += '/info'
+        return urlunparse((scheme, netloc, path, params, query, fragment))
+
+    def get_capabilities(self, url=None):
+        parsed = urlparse(self._map_url(url))
+        if not self.http_conn:
+            self.http_conn = self.http_connection(url)
+        return get_capabilities((parsed, self.http_conn[1]))

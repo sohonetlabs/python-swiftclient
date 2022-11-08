@@ -13,16 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
-
-import six
 import sys
 
 from concurrent.futures import ThreadPoolExecutor
-from six.moves.queue import PriorityQueue
+from queue import PriorityQueue
 
 
-class OutputManager(object):
+class OutputManager:
     """
     One object to manage and provide helper functions for output.
 
@@ -72,12 +69,8 @@ class OutputManager(object):
         self.print_pool.submit(self._write, data, self.print_stream)
 
     def _write(self, data, stream):
-        if six.PY3:
-            stream.buffer.write(data)
-            stream.flush()
-        if six.PY2:
-            stream.write(data)
-            stream.flush()
+        stream.buffer.write(data)
+        stream.flush()
 
     def print_msg(self, msg, *fmt_args):
         if fmt_args:
@@ -102,8 +95,6 @@ class OutputManager(object):
     def _print(self, item, stream=None):
         if stream is None:
             stream = self.print_stream
-        if six.PY2 and isinstance(item, six.text_type):
-            item = item.encode('utf8')
         print(item, file=stream)
 
     def _print_error(self, item, count=1):
@@ -117,7 +108,7 @@ class OutputManager(object):
         self.error_print_pool.submit(self._print_error, msg, count=0)
 
 
-class MultiThreadingManager(object):
+class MultiThreadingManager:
     """
     One object to manage context for multi-threading.  This should make
     bin/swift less error-prone and allow us to test this code.
@@ -168,6 +159,12 @@ class ConnectionThreadPoolExecutor(ThreadPoolExecutor):
     We will only create as many connections as are required concurrently.
     """
     def __init__(self, create_connection, max_workers):
+        """
+        Initializes a new ThreadPoolExecutor instance.
+
+        :param create_connection: callable to use to create new connections
+        :param max_workers: the maximum number of threads that can be used
+        """
         self._connections = PriorityQueue()
         self._create_connection = create_connection
         for p in range(0, max_workers):
@@ -175,6 +172,14 @@ class ConnectionThreadPoolExecutor(ThreadPoolExecutor):
         super(ConnectionThreadPoolExecutor, self).__init__(max_workers)
 
     def submit(self, fn, *args, **kwargs):
+        """
+        Schedules the callable, `fn`, to be executed
+
+        :param fn: the callable to be invoked
+        :param args: the positional arguments for the callable
+        :param kwargs: the keyword arguments for the callable
+        :returns: a Future object representing the execution of the callable
+        """
         def conn_fn():
             priority = None
             conn = None

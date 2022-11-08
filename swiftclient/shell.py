@@ -14,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function, unicode_literals
-
 import argparse
 import getpass
 import io
@@ -27,13 +25,13 @@ import warnings
 
 from os import environ, walk, _exit as os_exit
 from os.path import isfile, isdir, join
-from six import text_type, PY2
-from six.moves.urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse
 from sys import argv as sys_argv, exit, stderr, stdin
 from time import gmtime, strftime
 
 from swiftclient import RequestException
-from swiftclient.utils import config_true_value, generate_temp_url, prt_bytes
+from swiftclient.utils import config_true_value, generate_temp_url, \
+    prt_bytes, JSONableIterable
 from swiftclient.multithreading import OutputManager
 from swiftclient.exceptions import ClientException
 from swiftclient import __version__ as client_version
@@ -51,19 +49,21 @@ except ImportError:
 
 BASENAME = 'swift'
 commands = ('delete', 'download', 'list', 'post', 'copy', 'stat', 'upload',
-            'capabilities', 'info', 'tempurl', 'auth')
+            'capabilities', 'info', 'tempurl', 'auth', 'bash_completion')
 
 
 def immediate_exit(signum, frame):
     stderr.write(" Aborted\n")
     os_exit(2)
 
+
 st_delete_options = '''[--all] [--leave-segments]
                     [--object-threads <threads>]
                     [--container-threads <threads>]
                     [--header <header:value>]
                     [--prefix <prefix>]
-                    [<container> [<object>] [...]]
+                    [--versions]
+                    [<container> [<object>] [--version-id <version_id>] [...]]
 '''
 
 st_delete_help = '''
@@ -75,7 +75,8 @@ Positional arguments:
                         for multiple objects.
 
 Optional arguments:
-  -a, --all             Delete all containers and objects.
+  -a, --all             Delete all containers and objects. Implies --versions.
+  --versions            Delete all versions.
   --leave-segments      Do not delete segments of manifest objects.
   -H, --header <header:value>
                         Adds a custom request header to use for deleting
@@ -87,16 +88,23 @@ Optional arguments:
                         Number of threads to use for deleting containers.
                         Default is 10.
   --prefix <prefix>     Only delete objects beginning with <prefix>.
+  --version-id <version-id>
+                        Delete specific version of a versioned object.
 '''.strip("\n")
 
 
-def st_delete(parser, args, output_manager):
+def st_delete(parser, args, output_manager, return_parser=False):
     parser.add_argument(
         '-a', '--all', action='store_true', dest='yes_all',
         default=False, help='Delete all containers and objects.')
+    parser.add_argument('--versions', action='store_true',
+                        help='delete all versions')
     parser.add_argument(
         '-p', '--prefix', dest='prefix',
         help='Only delete items beginning with <prefix>.')
+    parser.add_argument(
+        '--version-id', action='store', default=None,
+        help='Delete a specific version of a versioned object')
     parser.add_argument(
         '-H', '--header', action='append', dest='header',
         default=[],
@@ -114,13 +122,24 @@ def st_delete(parser, args, output_manager):
         '--container-threads', type=int,
         default=10, help='Number of threads to use for deleting containers. '
         'Its value must be a positive integer. Default is 10.')
+
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
+
     (options, args) = parse_args(parser, args)
     args = args[1:]
+    if options['yes_all']:
+        options['versions'] = True
     if (not args and not options['yes_all']) or (args and options['yes_all']):
         output_manager.error('Usage: %s delete %s\n%s',
                              BASENAME, st_delete_options,
                              st_delete_help)
         return
+    if options['versions'] and len(args) >= 2:
+        exit('--versions option not allowed for object deletes')
+    if options['version_id'] and len(args) < 2:
+        exit('--version-id option only allowed for object deletes')
 
     if options['object_threads'] <= 0:
         output_manager.error(
@@ -162,7 +181,8 @@ def st_delete(parser, args, output_manager):
             for r in del_iter:
                 c = r.get('container', '')
                 o = r.get('object', '')
-                a = r.get('attempts')
+                a = (' [after {0} attempts]'.format(r.get('attempts'))
+                     if r.get('attempts', 1) > 1 else '')
 
                 if r['action'] == 'bulk_delete':
                     if r['success']:
@@ -170,10 +190,6 @@ def st_delete(parser, args, output_manager):
                         for o, err in r.get('result', {}).get('Errors', []):
                             # o will be of the form quote("/<cont>/<obj>")
                             o = unquote(o)
-                            if PY2:
-                                # In PY3, unquote(unicode) uses utf-8 like we
-                                # want, but PY2 uses latin-1
-                                o = o.encode('latin-1').decode('utf-8')
                             output_manager.error('Error Deleting: {0}: {1}'
                                                  .format(o[1:], err))
                             try:
@@ -195,9 +211,6 @@ def st_delete(parser, args, output_manager):
                 else:
                     if r['success']:
                         if options['verbose']:
-                            a = (' [after {0} attempts]'.format(a)
-                                 if a > 1 else '')
-
                             if r['action'] == 'delete_object':
                                 if options['yes_all']:
                                     p = '{0}/{1}'.format(c, o)
@@ -222,6 +235,7 @@ st_download_options = '''[--all] [--marker <marker>] [--prefix <prefix>]
                       [--object-threads <threads>] [--ignore-checksum]
                       [--container-threads <threads>] [--no-download]
                       [--skip-identical] [--remove-prefix]
+                      [--version-id <version_id>]
                       [--header <header:value>] [--no-shuffle]
                       [<container> [<object>] [...]]
 '''
@@ -266,6 +280,8 @@ Optional arguments:
                         Example: --header "content-type:text/plain"
   --skip-identical      Skip downloading files that are identical on both
                         sides.
+  --version-id <version-id>
+                        Download specific version of a versioned object.
   --ignore-checksum     Turn off checksum validation for downloads.
   --no-shuffle          By default, when downloading a complete account or
                         container, download order is randomised in order to
@@ -281,7 +297,7 @@ Optional arguments:
 '''.strip("\n")
 
 
-def st_download(parser, args, output_manager):
+def st_download(parser, args, output_manager, return_parser=False):
     parser.add_argument(
         '-a', '--all', action='store_true', dest='yes_all',
         default=False, help='Indicates that you really want to download '
@@ -328,6 +344,9 @@ def st_download(parser, args, output_manager):
         default=False, help='Skip downloading files that are identical on '
         'both sides.')
     parser.add_argument(
+        '--version-id', action='store', default=None,
+        help='Download a specific version of a versioned object')
+    parser.add_argument(
         '--ignore-checksum', action='store_false', dest='checksum',
         default=True, help='Turn off checksum validation for downloads.')
     parser.add_argument(
@@ -344,6 +363,11 @@ def st_download(parser, args, output_manager):
         'to store the access and modified timestamp for the downloaded file. '
         'With this option, the header is ignored and the timestamps are '
         'created freshly.')
+
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
+
     (options, args) = parse_args(parser, args)
     args = args[1:]
     if options['out_file'] == '-':
@@ -362,6 +386,8 @@ def st_download(parser, args, output_manager):
         output_manager.error('Usage: %s download %s\n%s', BASENAME,
                              st_download_options, st_download_help)
         return
+    if options['version_id'] and len(args) < 2:
+        exit('--version-id option only allowed for object downloads')
 
     if options['object_threads'] <= 0:
         output_manager.error(
@@ -469,7 +495,7 @@ def st_download(parser, args, output_manager):
 
 st_list_options = '''[--long] [--lh] [--totals] [--prefix <prefix>]
                   [--delimiter <delimiter>] [--header <header:value>]
-                  [<container>]
+                  [--versions] [<container>]
 '''
 
 st_list_help = '''
@@ -489,36 +515,38 @@ Optional arguments:
                         Roll up items with the given delimiter. For containers
                         only. See OpenStack Swift API documentation for what
                         this means.
+  -j, --json            Display listing information in json
+  --versions            Display listing information for all versions
   -H, --header <header:value>
                         Adds a custom request header to use for listing.
 '''.strip('\n')
 
 
-def st_list(parser, args, output_manager):
+def st_list(parser, args, output_manager, return_parser=False):
 
-    def _print_stats(options, stats, human):
-        total_count = total_bytes = 0
+    def _print_stats(options, stats, human, totals):
         container = stats.get("container", None)
         for item in stats["listing"]:
             item_name = item.get('name')
-            if not options['long'] and not human:
+            if not options['long'] and not human and not options['versions']:
                 output_manager.print_msg(item.get('name', item.get('subdir')))
             else:
                 if not container:    # listing containers
                     item_bytes = item.get('bytes')
                     byte_str = prt_bytes(item_bytes, human)
                     count = item.get('count')
-                    total_count += count
+                    totals['count'] += count
                     try:
                         meta = item.get('meta')
                         utc = gmtime(float(meta.get('x-timestamp')))
                         datestamp = strftime('%Y-%m-%d %H:%M:%S', utc)
                     except TypeError:
                         datestamp = '????-??-?? ??:??:??'
+                    storage_policy = meta.get('x-storage-policy', '???')
                     if not options['totals']:
                         output_manager.print_msg(
-                            "%5s %s %s %s", count, byte_str,
-                            datestamp, item_name)
+                            "%12s %s %s %-15s %s", count, byte_str,
+                            datestamp, storage_policy, item_name)
                 else:    # list container contents
                     subdir = item.get('subdir')
                     content_type = item.get('content_type')
@@ -533,20 +561,17 @@ def st_list(parser, args, output_manager):
                         date = xtime = ''
                         item_name = subdir
                     if not options['totals']:
-                        output_manager.print_msg(
-                            "%s %10s %8s %24s %s",
-                            byte_str, date, xtime, content_type, item_name)
-                total_bytes += item_bytes
-
-        # report totals
-        if options['long'] or human:
-            if not container:
-                output_manager.print_msg(
-                    "%5s %s", prt_bytes(total_count, True),
-                    prt_bytes(total_bytes, human))
-            else:
-                output_manager.print_msg(
-                    prt_bytes(total_bytes, human))
+                        if options['versions']:
+                            output_manager.print_msg(
+                                "%s %10s %8s %16s %24s %s",
+                                byte_str, date, xtime,
+                                item.get('version_id', 'null'),
+                                content_type, item_name)
+                        else:
+                            output_manager.print_msg(
+                                "%s %10s %8s %24s %s",
+                                byte_str, date, xtime, content_type, item_name)
+                totals['bytes'] += item_bytes
 
     parser.add_argument(
         '-l', '--long', dest='long', action='store_true', default=False,
@@ -567,14 +592,25 @@ def st_list(parser, args, output_manager):
         help='Roll up items with the given delimiter. For containers '
              'only. See OpenStack Swift API documentation for '
              'what this means.')
+    parser.add_argument('-j', '--json', action='store_true',
+                        help='print listing information in json')
+    parser.add_argument('--versions', action='store_true',
+                        help='display all versions')
     parser.add_argument(
         '-H', '--header', action='append', dest='header',
         default=[],
         help='Adds a custom request header to use for listing.')
+
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
+
     options, args = parse_args(parser, args)
     args = args[1:]
     if options['delimiter'] and not args:
         exit('-d option only allowed for container listings')
+    if options['versions'] and not args:
+        exit('--versions option only allowed for container listings')
 
     human = options.pop('human')
     if human:
@@ -589,6 +625,7 @@ def st_list(parser, args, output_manager):
         try:
             if not args:
                 stats_parts_gen = swift.list()
+                container = None
             else:
                 container = args[0]
                 args = args[1:]
@@ -600,17 +637,44 @@ def st_list(parser, args, output_manager):
                 else:
                     stats_parts_gen = swift.list(container=container)
 
+            if options.get('json', False):
+                def listing(stats_parts_gen=stats_parts_gen):
+                    for stats in stats_parts_gen:
+                        if stats["success"]:
+                            for item in stats['listing']:
+                                yield item
+                        else:
+                            raise stats["error"]
+
+                json.dump(
+                    JSONableIterable(listing()), output_manager.print_stream,
+                    sort_keys=True, indent=2)
+                output_manager.print_msg('')
+                return
+
+            totals = {'count': 0, 'bytes': 0}
             for stats in stats_parts_gen:
                 if stats["success"]:
-                    _print_stats(options, stats, human)
+                    _print_stats(options, stats, human, totals)
                 else:
                     raise stats["error"]
+
+            # report totals
+            if options['long'] or human:
+                if container is None:
+                    output_manager.print_msg(
+                        "%12s %s", prt_bytes(totals['count'], True),
+                        prt_bytes(totals['bytes'], human))
+                else:
+                    output_manager.print_msg(
+                        prt_bytes(totals['bytes'], human))
 
         except SwiftError as e:
             output_manager.error(e.value)
 
 
 st_stat_options = '''[--lh] [--header <header:value>]
+                  [--version-id <version_id>]
                   [<container> [<object>]]
 '''
 
@@ -624,22 +688,33 @@ Positional arguments:
 Optional arguments:
   --lh                  Report sizes in human readable format similar to
                         ls -lh.
+  --version-id <version-id>
+                        Report stat of specific version of a versioned object.
   -H, --header <header:value>
                         Adds a custom request header to use for stat.
 '''.strip('\n')
 
 
-def st_stat(parser, args, output_manager):
+def st_stat(parser, args, output_manager, return_parser=False):
     parser.add_argument(
         '--lh', dest='human', action='store_true', default=False,
         help='Report sizes in human readable format similar to ls -lh.')
+    parser.add_argument(
+        '--version-id', action='store', default=None,
+        help='Report stat of a specific version of a versioned object')
     parser.add_argument(
         '-H', '--header', action='append', dest='header',
         default=[],
         help='Adds a custom request header to use for stat.')
 
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
+
     options, args = parse_args(parser, args)
     args = args[1:]
+    if options['version_id'] and len(args) < 2:
+        exit('--version-id option only allowed for object stats')
 
     with SwiftService(options=options) as swift:
         try:
@@ -689,7 +764,7 @@ def st_stat(parser, args, output_manager):
             output_manager.error(e.value)
 
 
-st_post_options = '''[--read-acl <acl>] [--write-acl <acl>] [--sync-to]
+st_post_options = '''[--read-acl <acl>] [--write-acl <acl>] [--sync-to <sync-to>]
                   [--sync-key <sync-key>] [--meta <name:value>]
                   [--header <header>]
                   [<container> [<object>]]
@@ -725,7 +800,7 @@ Optional arguments:
 '''.strip('\n')
 
 
-def st_post(parser, args, output_manager):
+def st_post(parser, args, output_manager, return_parser=False):
     parser.add_argument(
         '-r', '--read-acl', dest='read_acl', help='Read ACL for containers. '
         'Quick summary of ACL syntax: .r:*, .r:-.example.com, '
@@ -750,6 +825,11 @@ def st_post(parser, args, output_manager):
         'This option may be repeated. '
         'Example: -H "content-type:text/plain" '
         '-H "Content-Length: 4000"')
+
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
+
     (options, args) = parse_args(parser, args)
     args = args[1:]
     if (options['read_acl'] or options['write_acl'] or options['sync_to'] or
@@ -822,7 +902,7 @@ Optional arguments:
 '''.strip('\n')
 
 
-def st_copy(parser, args, output_manager):
+def st_copy(parser, args, output_manager, return_parser=False):
     parser.add_argument(
         '-d', '--destination', help='The container and name of the '
         'destination object')
@@ -839,6 +919,11 @@ def st_copy(parser, args, output_manager):
         'This option may be repeated. '
         'Example: -H "content-type:text/plain" '
         '-H "Content-Length: 4000"')
+
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
+
     (options, args) = parse_args(parser, args)
     args = args[1:]
 
@@ -893,8 +978,9 @@ def st_copy(parser, args, output_manager):
 st_upload_options = '''[--changed] [--skip-identical] [--segment-size <size>]
                     [--segment-container <container>] [--leave-segments]
                     [--object-threads <thread>] [--segment-threads <threads>]
-                    [--meta <name:value>] [--header <header>] [--use-slo]
-                    [--ignore-checksum] [--object-name <object-name>]
+                    [--meta <name:value>] [--header <header>]
+                    [--use-slo] [--ignore-checksum] [--skip-container-put]
+                    [--object-name <object-name>]
                     <container> <file_or_directory> [<file_or_directory>] [...]
 '''
 
@@ -940,15 +1026,17 @@ Optional arguments:
   --use-slo             When used in conjunction with --segment-size it will
                         create a Static Large Object instead of the default
                         Dynamic Large Object.
+  --ignore-checksum     Turn off checksum validation for uploads.
+  --skip-container-put  Assume all necessary containers already exist; don't
+                        automatically try to create them.
   --object-name <object-name>
                         Upload file and name object to <object-name> or upload
                         dir and use <object-name> as object prefix instead of
                         folder name.
-  --ignore-checksum     Turn off checksum validation for uploads.
 '''.strip('\n')
 
 
-def st_upload(parser, args, output_manager):
+def st_upload(parser, args, output_manager, return_parser=False):
     DEFAULT_STDIN_SEGMENT = 10 * 1024 * 1024
 
     parser.add_argument(
@@ -959,6 +1047,10 @@ def st_upload(parser, args, output_manager):
         '--skip-identical', action='store_true', dest='skip_identical',
         default=False, help='Skip uploading files that are identical on '
         'both sides.')
+    parser.add_argument(
+        '--skip-container-put', action='store_true', dest='skip_container_put',
+        default=False, help='Assume all necessary containers already exist; '
+        "don't automatically try to create them.")
     parser.add_argument(
         '-S', '--segment-size', dest='segment_size', help='Upload files '
         'in segments no larger than <size> (in Bytes) and then create a '
@@ -1006,6 +1098,11 @@ def st_upload(parser, args, output_manager):
     parser.add_argument(
         '--ignore-checksum', dest='checksum', default=True,
         action='store_false', help='Turn off checksum validation for uploads.')
+
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
+
     options, args = parse_args(parser, args)
     args = args[1:]
     if len(args) < 2:
@@ -1185,7 +1282,7 @@ Optional arguments:
 st_info_help = st_capabilities_help
 
 
-def st_capabilities(parser, args, output_manager):
+def st_capabilities(parser, args, output_manager, return_parser=False):
     def _print_compo_cap(name, capabilities):
         for feature, options in sorted(capabilities.items(),
                                        key=lambda x: x[0]):
@@ -1198,6 +1295,11 @@ def st_capabilities(parser, args, output_manager):
 
     parser.add_argument('--json', action='store_true',
                         help='print capability information in json')
+
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
+
     (options, args) = parse_args(parser, args)
     if args and len(args) > 2:
         output_manager.error('Usage: %s capabilities %s\n%s',
@@ -1246,7 +1348,12 @@ Display auth related authentication variables in shell friendly format.
 '''.strip('\n')
 
 
-def st_auth(parser, args, thread_manager):
+def st_auth(parser, args, thread_manager, return_parser=False):
+
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
+
     (options, args) = parse_args(parser, args)
     if options['verbose'] > 1:
         if options['auth_version'] in ('1', '1.0'):
@@ -1281,14 +1388,16 @@ Positional arguments:
   <method>              An HTTP method to allow for this temporary URL.
                         Usually 'GET' or 'PUT'.
   <time>                The amount of time the temporary URL will be
-                        valid. The time can be specified in two ways:
-                        an integer representing the time in seconds or an
-                        ISO 8601 timestamp in a specific format.
-                        If --absolute is passed and time
-                        is an integer, the seconds are intepreted as the Unix
-                        timestamp when the temporary URL will expire. The ISO
-                        8601 timestamp can be specified in one of following
-                        formats:
+                        valid. The time can be specified in three ways:
+                        an integer representing the time in seconds;
+                        a number with a 's', 'm', 'h', or 'd' suffix to specify
+                        the time in seconds, minutes, hours, or days; or
+                        an ISO 8601 timestamp in a specific format.
+                        If --absolute is passed and time is an integer, the
+                        seconds are intepreted as the Unix timestamp when the
+                        temporary URL will expire.
+                        The ISO 8601 timestamp can be specified in one of
+                        following formats:
 
                         i) Complete date: YYYY-MM-DD (eg 1997-07-16)
 
@@ -1325,10 +1434,14 @@ Optional arguments:
                         generated.
   --iso8601             If present, the generated temporary URL will contain an
                         ISO 8601 UTC timestamp instead of a Unix timestamp.
+  --ip-range            If present, the temporary URL will be restricted to the
+                        given ip or ip range.
+  --digest              The digest algorithm to use. Defaults to sha256, but
+                        older clusters may only support sha1.
 '''.strip('\n')
 
 
-def st_tempurl(parser, args, thread_manager):
+def st_tempurl(parser, args, thread_manager, return_parser=False):
     parser.add_argument(
         '--absolute', action='store_true',
         dest='absolute_expiry', default=False,
@@ -1348,6 +1461,22 @@ def st_tempurl(parser, args, thread_manager):
         help=("If present, the temporary URL will contain an ISO 8601 UTC "
               "timestamp instead of a Unix timestamp."),
     )
+    parser.add_argument(
+        '--ip-range', action='store',
+        default=None,
+        help=("If present, the temporary URL will be restricted to the "
+              "given ip or ip range."),
+    )
+    parser.add_argument(
+        '--digest', choices=('sha1', 'sha256', 'sha512'),
+        default='sha256',
+        help=("The digest algorithm to use. Defaults to sha256, but "
+              "older clusters may only support sha1."),
+    )
+
+    # We return the parser to build up the bash_completion
+    if return_parser:
+        return parser
 
     (options, args) = parse_args(parser, args)
     args = args[1:]
@@ -1367,7 +1496,9 @@ def st_tempurl(parser, args, thread_manager):
         path = generate_temp_url(parsed.path, timestamp, key, method,
                                  absolute=options['absolute_expiry'],
                                  iso8601=options['iso8601'],
-                                 prefix=options['prefix_based'])
+                                 prefix=options['prefix_based'],
+                                 ip_range=options['ip_range'],
+                                 digest=options['digest'])
     except ValueError as err:
         thread_manager.error(err)
         return
@@ -1377,6 +1508,66 @@ def st_tempurl(parser, args, thread_manager):
     else:
         url = path
     thread_manager.print_msg(url)
+
+
+st_bash_completion_help = '''Retrieve command specific flags used by bash_completion.
+
+Optional positional arguments:
+  <command>           Swift client command to filter the flags by.
+'''.strip('\n')
+
+
+st_bash_completion_options = '''[command]
+'''
+
+
+def st_bash_completion(parser, args, thread_manager, return_parser=False):
+    if return_parser:
+        return parser
+
+    global commands
+    com = args[1] if len(args) > 1 else None
+
+    if com:
+        if com in commands:
+            fn_commands = ["st_%s" % com]
+        else:
+            print("")
+            return
+    else:
+        fn_commands = [fn for fn in globals().keys()
+                       if fn.startswith('st_') and
+                       not fn.endswith('_options') and
+                       not fn.endswith('_help')]
+
+    subparsers = parser.add_subparsers()
+    subcommands = {}
+    if not com:
+        subcommands['base'] = parser
+    for command in fn_commands:
+        cmd = command[3:]
+        if com:
+            subparser = subparsers.add_parser(
+                cmd, help=globals()['%s_help' % command])
+            add_default_args(subparser)
+            subparser = globals()[command](
+                subparser, args, thread_manager, True)
+            subcommands[cmd] = subparser
+        else:
+            subcommands[cmd] = None
+
+    cmds = set()
+    opts = set()
+    for sc_str, sc in list(subcommands.items()):
+        cmds.add(sc_str)
+        if sc:
+            for option in sc._optionals._option_string_actions:
+                opts.add(option)
+
+    for cmd_to_remove in (com, 'bash_completion', 'base'):
+        if cmd_to_remove in cmds:
+            cmds.remove(cmd_to_remove)
+    print(' '.join(cmds | opts))
 
 
 class HelpFormatter(argparse.HelpFormatter):
@@ -1476,16 +1667,29 @@ def parse_args(parser, args, enforce_requires=True):
         return options, args
 
     if enforce_requires:
-        if options['auth_version'] == '3':
+        if options['os_auth_type'] and options['os_auth_type'] not in (
+                'password', 'v1password', 'v2password', 'v3password',
+                'v3applicationcredential'):
+            exit('Only "v3applicationcredential" is supported for '
+                 '--os-auth-type')
+        elif options['os_auth_type'] == 'v3applicationcredential':
+            if not (options['os_application_credential_id'] and
+                    options['os_application_credential_secret']):
+                exit('Auth version 3 (application credential) requires '
+                     'OS_APPLICATION_CREDENTIAL_ID and '
+                     'OS_APPLICATION_CREDENTIAL_SECRET to be set or '
+                     'overridden with --os-application-credential-id and '
+                     '--os-application-credential-secret respectively.')
+        elif options['auth_version'] == '3':
             if not options['auth']:
-                exit('Auth version 3 requires OS_AUTH_URL to be set or ' +
+                exit('Auth version 3 requires OS_AUTH_URL to be set or '
                      'overridden with --os-auth-url')
             if not (options['user'] or options['os_user_id']):
-                exit('Auth version 3 requires either OS_USERNAME or ' +
-                     'OS_USER_ID to be set or overridden with ' +
+                exit('Auth version 3 requires either OS_USERNAME or '
+                     'OS_USER_ID to be set or overridden with '
                      '--os-username or --os-user-id respectively.')
             if not options['key']:
-                exit('Auth version 3 requires OS_PASSWORD to be set or ' +
+                exit('Auth version 3 requires OS_PASSWORD to be set or '
                      'overridden with --os-password')
         elif not (options['auth'] and options['user'] and options['key']):
             exit('''
@@ -1499,94 +1703,7 @@ adding "-V 2" is necessary for this.'''.strip('\n'))
     return options, args
 
 
-def main(arguments=None):
-    argv = sys_argv if arguments is None else arguments
-
-    argv = [a if isinstance(a, text_type) else a.decode('utf-8') for a in argv]
-
-    version = client_version
-    parser = argparse.ArgumentParser(
-        add_help=False, formatter_class=HelpFormatter, usage='''
-%(prog)s [--version] [--help] [--os-help] [--snet] [--verbose]
-             [--debug] [--info] [--quiet] [--auth <auth_url>]
-             [--auth-version <auth_version> |
-                 --os-identity-api-version <auth_version> ]
-             [--user <username>]
-             [--key <api_key>] [--retries <num_retries>]
-             [--os-username <auth-user-name>]
-             [--os-password <auth-password>]
-             [--os-user-id <auth-user-id>]
-             [--os-user-domain-id <auth-user-domain-id>]
-             [--os-user-domain-name <auth-user-domain-name>]
-             [--os-tenant-id <auth-tenant-id>]
-             [--os-tenant-name <auth-tenant-name>]
-             [--os-project-id <auth-project-id>]
-             [--os-project-name <auth-project-name>]
-             [--os-project-domain-id <auth-project-domain-id>]
-             [--os-project-domain-name <auth-project-domain-name>]
-             [--os-auth-url <auth-url>]
-             [--os-auth-token <auth-token>]
-             [--os-storage-url <storage-url>]
-             [--os-region-name <region-name>]
-             [--os-service-type <service-type>]
-             [--os-endpoint-type <endpoint-type>]
-             [--os-cacert <ca-certificate>]
-             [--insecure]
-             [--os-cert <client-certificate-file>]
-             [--os-key <client-certificate-key-file>]
-             [--no-ssl-compression]
-             [--force-auth-retry]
-             [--prompt]
-             <subcommand> [--help] [<subcommand options>]
-
-Command-line interface to the OpenStack Swift API.
-
-Positional arguments:
-  <subcommand>
-    delete               Delete a container or objects within a container.
-    download             Download objects from containers.
-    list                 Lists the containers for the account or the objects
-                         for a container.
-    post                 Updates meta information for the account, container,
-                         or object; creates containers if not present.
-    copy                 Copies object, optionally adds meta
-    stat                 Displays information for the account, container,
-                         or object.
-    upload               Uploads files or directories to the given container.
-    capabilities         List cluster capabilities.
-    tempurl              Create a temporary URL.
-    auth                 Display auth related environment variables.
-
-Examples:
-  %(prog)s download --help
-
-  %(prog)s -A https://api.example.com/v1.0 \\
-      -U user -K api_key stat -v
-
-  %(prog)s --os-auth-url https://api.example.com/v2.0 \\
-      --os-tenant-name tenant \\
-      --os-username user --os-password password list
-
-  %(prog)s --os-auth-url https://api.example.com/v3 --auth-version 3\\
-      --os-project-name project1 --os-project-domain-name domain1 \\
-      --os-username user --os-user-domain-name domain1 \\
-      --os-password password list
-
-  %(prog)s --os-auth-url https://api.example.com/v3 --auth-version 3\\
-      --os-project-id 0123456789abcdef0123456789abcdef \\
-      --os-user-id abcdef0123456789abcdef0123456789 \\
-      --os-password password list
-
-  %(prog)s --os-auth-token 6ee5eb33efad4e45ab46806eac010566 \\
-      --os-storage-url https://10.1.5.2:8080/v1/AUTH_ced809b6a4baea7aeab61a \\
-      list
-
-  %(prog)s list --lh
-'''.strip('\n'))
-    parser.add_argument('--version', action='version',
-                        version='python-swiftclient %s' % version)
-    parser.add_argument('-h', '--help', action='store_true')
-
+def add_default_args(parser):
     default_auth_version = '1.0'
     for k in ('ST_AUTH_VERSION', 'OS_AUTH_VERSION', 'OS_IDENTITY_API_VERSION'):
         try:
@@ -1629,6 +1746,9 @@ Examples:
     parser.add_argument('-K', '--key', dest='key',
                         default=environ.get('ST_KEY'),
                         help='Key for obtaining an auth token.')
+    parser.add_argument('-T', '--timeout', type=int, dest='timeout',
+                        default=None,
+                        help='Timeout in seconds to wait for response.')
     parser.add_argument('-R', '--retries', type=int, default=5, dest='retries',
                         help='The number of times to retry a failed '
                              'connection.')
@@ -1743,6 +1863,29 @@ Examples:
                              'env[OS_AUTH_URL].')
     os_grp.add_argument('--os_auth_url',
                         help=argparse.SUPPRESS)
+    os_grp.add_argument('--os-auth-type',
+                        metavar='<auth-type>',
+                        default=environ.get('OS_AUTH_TYPE'),
+                        help='OpenStack auth type for v3. Defaults to '
+                             'env[OS_AUTH_TYPE].')
+    os_grp.add_argument('--os_auth_type',
+                        help=argparse.SUPPRESS)
+    os_grp.add_argument('--os-application-credential-id',
+                        metavar='<auth-application-credential-id>',
+                        default=environ.get('OS_APPLICATION_CREDENTIAL_ID'),
+                        help='OpenStack appplication credential id. '
+                             'Defaults to env[OS_APPLICATION_CREDENTIAL_ID].')
+    os_grp.add_argument('--os_application_credential_id',
+                        help=argparse.SUPPRESS)
+    os_grp.add_argument('--os-application-credential-secret',
+                        metavar='<auth-application-credential-secret>',
+                        default=environ.get(
+                            'OS_APPLICATION_CREDENTIAL_SECRET'),
+                        help='OpenStack appplication credential secret. '
+                             'Defaults to '
+                             'env[OS_APPLICATION_CREDENTIAL_SECRET].')
+    os_grp.add_argument('--os_application_credential_secret',
+                        help=argparse.SUPPRESS)
     os_grp.add_argument('--os-auth-token',
                         metavar='<auth-token>',
                         default=environ.get('OS_AUTH_TOKEN'),
@@ -1799,6 +1942,108 @@ Examples:
                         default=environ.get('OS_KEY'),
                         help='Specify a client certificate key file (for '
                         'client auth). Defaults to env[OS_KEY].')
+
+
+def main(arguments=None):
+    argv = sys_argv if arguments is None else arguments
+
+    parser = argparse.ArgumentParser(
+        add_help=False, formatter_class=HelpFormatter, usage='''
+%(prog)s [--version] [--help] [--os-help] [--snet] [--verbose]
+             [--debug] [--info] [--quiet] [--auth <auth_url>]
+             [--auth-version <auth_version> |
+                 --os-identity-api-version <auth_version> ]
+             [--user <username>]
+             [--key <api_key>] [--retries <num_retries>]
+             [--os-username <auth-user-name>]
+             [--os-password <auth-password>]
+             [--os-user-id <auth-user-id>]
+             [--os-user-domain-id <auth-user-domain-id>]
+             [--os-user-domain-name <auth-user-domain-name>]
+             [--os-tenant-id <auth-tenant-id>]
+             [--os-tenant-name <auth-tenant-name>]
+             [--os-project-id <auth-project-id>]
+             [--os-project-name <auth-project-name>]
+             [--os-project-domain-id <auth-project-domain-id>]
+             [--os-project-domain-name <auth-project-domain-name>]
+             [--os-auth-url <auth-url>]
+             [--os-auth-token <auth-token>]
+             [--os-auth-type <os-auth-type>]
+             [--os-application-credential-id
+                   <auth-application-credential-id>]
+             [--os-application-credential-secret
+                   <auth-application-credential-secret>]
+             [--os-storage-url <storage-url>]
+             [--os-region-name <region-name>]
+             [--os-service-type <service-type>]
+             [--os-endpoint-type <endpoint-type>]
+             [--os-cacert <ca-certificate>]
+             [--insecure]
+             [--os-cert <client-certificate-file>]
+             [--os-key <client-certificate-key-file>]
+             [--no-ssl-compression]
+             [--force-auth-retry]
+             <subcommand> [--help] [<subcommand options>]
+
+Command-line interface to the OpenStack Swift API.
+
+Positional arguments:
+  <subcommand>
+    delete               Delete a container or objects within a container.
+    download             Download objects from containers.
+    list                 Lists the containers for the account or the objects
+                         for a container.
+    post                 Updates meta information for the account, container,
+                         or object; creates containers if not present.
+    copy                 Copies object, optionally adds meta
+    stat                 Displays information for the account, container,
+                         or object.
+    upload               Uploads files or directories to the given container.
+    capabilities         List cluster capabilities.
+    tempurl              Create a temporary URL.
+    auth                 Display auth related environment variables.
+    bash_completion      Outputs option and flag cli data ready for
+                         bash_completion.
+
+Examples:
+  %(prog)s download --help
+
+  %(prog)s -A https://api.example.com/v1.0 \\
+      -U user -K api_key stat -v
+
+  %(prog)s --os-auth-url https://api.example.com/v2.0 \\
+      --os-tenant-name tenant \\
+      --os-username user --os-password password list
+
+  %(prog)s --os-auth-url https://api.example.com/v3 --auth-version 3\\
+      --os-project-name project1 --os-project-domain-name domain1 \\
+      --os-username user --os-user-domain-name domain1 \\
+      --os-password password list
+
+  %(prog)s --os-auth-url https://api.example.com/v3 --auth-version 3\\
+      --os-project-id 0123456789abcdef0123456789abcdef \\
+      --os-user-id abcdef0123456789abcdef0123456789 \\
+      --os-password password list
+
+  %(prog)s --os-auth-url https://api.example.com/v3 --auth-version 3\\
+      --os-application-credential-id d78683c92f0e4f9b9b02a2e208039412 \\
+      --os-application-credential-secret APPLICATION_CREDENTIAL_SECRET \\
+      --os-auth-type v3applicationcredential list
+
+  %(prog)s --os-auth-token 6ee5eb33efad4e45ab46806eac010566 \\
+      --os-storage-url https://10.1.5.2:8080/v1/AUTH_ced809b6a4baea7aeab61a \\
+      list
+
+  %(prog)s list --lh
+'''.strip('\n'))
+
+    version = client_version
+    parser.add_argument('--version', action='version',
+                        version='python-swiftclient %s' % version)
+    parser.add_argument('-h', '--help', action='store_true')
+
+    add_default_args(parser)
+
     options, args = parse_args(parser, argv[1:], enforce_requires=False)
 
     if options['help'] or options['os_help']:
@@ -1819,14 +2064,20 @@ Examples:
         parser.usage = globals()['st_%s_help' % args[0]]
         if options['insecure']:
             import requests
-            from requests.packages.urllib3.exceptions import \
-                InsecureRequestWarning
-            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+            try:
+                from requests.packages.urllib3.exceptions import \
+                    InsecureRequestWarning
+            except ImportError:
+                pass
+            else:
+                requests.packages.urllib3.disable_warnings(
+                    InsecureRequestWarning)
         try:
             globals()['st_%s' % args[0]](parser, argv[1:], output)
         except ClientException as err:
+            trans_id = err.transaction_id
+            err.transaction_id = None  # clear it so we aren't overly noisy
             output.error(str(err))
-            trans_id = (err.http_response_headers or {}).get('X-Trans-Id')
             if trans_id:
                 output.error("Failed Transaction ID: %s",
                              parse_header_string(trans_id))

@@ -13,14 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Miscellaneous utility functions for use with Swift."""
+
+import base64
 from calendar import timegm
-import collections
+from collections.abc import Mapping
 import gzip
 import hashlib
 import hmac
+import io
 import json
 import logging
-import six
 import time
 import traceback
 
@@ -39,7 +41,7 @@ def config_true_value(value):
     This function comes from swift.common.utils.config_true_value()
     """
     return value is True or \
-        (isinstance(value, six.string_types) and value.lower() in TRUE_VALUES)
+        (isinstance(value, str) and value.lower() in TRUE_VALUES)
 
 
 def prt_bytes(num_bytes, human_flag):
@@ -68,33 +70,7 @@ def prt_bytes(num_bytes, human_flag):
         return '%.1f%s' % (num, suffix)
 
 
-def generate_temp_url(path, seconds, key, method, absolute=False,
-                      prefix=False, iso8601=False):
-    """Generates a temporary URL that gives unauthenticated access to the
-    Swift object.
-
-    :param path: The full path to the Swift object or prefix if
-         a prefix-based temporary URL should be generated. Example:
-        /v1/AUTH_account/c/o or /v1/AUTH_account/c/prefix.
-    :param seconds: time in seconds or ISO 8601 timestamp.
-        If absolute is False and this is the string representation of an
-        integer, then this specifies the amount of time in seconds for which
-        the temporary URL will be valid.
-        If absolute is True then this specifies an absolute time at which the
-        temporary URL will expire.
-    :param key: The secret temporary URL key set on the Swift
-        cluster. To set a key, run 'swift post -m
-        "Temp-URL-Key: <substitute tempurl key here>"'
-    :param method: A HTTP method, typically either GET or PUT, to allow
-        for this temporary URL.
-    :param absolute: if True then the seconds parameter is interpreted as a
-        Unix timestamp, if seconds represents an integer.
-    :param prefix: if True then a prefix-based temporary URL will be generated.
-    :param iso8601: if True, a URL containing an ISO 8601 UTC timestamp
-        instead of a UNIX timestamp will be created.
-    :raises ValueError: if timestamp or path is not in valid format.
-    :return: the path portion of a temporary URL
-    """
+def parse_timestamp(seconds, absolute=False):
     try:
         try:
             timestamp = float(seconds)
@@ -118,6 +94,20 @@ def generate_temp_url(path, seconds, key, method, absolute=False,
                     absolute = True
                     break
 
+            if t is None and not absolute:
+                for suffix, multiplier in (
+                    ('s', 1),
+                    ('m', 60),
+                    ('min', 60),
+                    ('h', 60 * 60),
+                    ('hr', 60 * 60),
+                    ('d', 24 * 60 * 60),
+                ):
+                    if seconds.endswith(suffix):
+                        timestamp = t = int(
+                            multiplier * float(seconds[:-len(suffix)]))
+                        break
+
             if t is None:
                 raise ValueError()
         else:
@@ -128,14 +118,59 @@ def generate_temp_url(path, seconds, key, method, absolute=False,
                 raise ValueError()
     except ValueError:
         raise ValueError(TIME_ERRMSG)
+    return timestamp, absolute
 
-    if isinstance(path, six.binary_type):
+
+def generate_temp_url(path, seconds, key, method, absolute=False,
+                      prefix=False, iso8601=False, ip_range=None,
+                      digest='sha256'):
+    """Generates a temporary URL that gives unauthenticated access to the
+    Swift object.
+
+    :param path: The full path to the Swift object or prefix if
+        a prefix-based temporary URL should be generated. Example:
+        /v1/AUTH_account/c/o or /v1/AUTH_account/c/prefix.
+    :param seconds: time in seconds or ISO 8601 timestamp.
+        If absolute is False and this is the string representation of an
+        integer, then this specifies the amount of time in seconds for which
+        the temporary URL will be valid. This may include a suffix to scale
+        the value: 's' for seconds, 'm' (or 'min') for minutes,
+        'h' (or 'hr') for hours, or 'd' for days.
+        If absolute is True then this specifies an absolute time at which the
+        temporary URL will expire.
+    :param key: The secret temporary URL key set on the Swift
+        cluster. To set a key, run 'swift post -m
+        "Temp-URL-Key: <substitute tempurl key here>"'
+    :param method: A HTTP method, typically either GET or PUT, to allow
+        for this temporary URL.
+    :param absolute: if True then the seconds parameter is interpreted as a
+        Unix timestamp, if seconds represents an integer.
+    :param prefix: if True then a prefix-based temporary URL will be generated.
+    :param iso8601: if True, a URL containing an ISO 8601 UTC timestamp
+        instead of a UNIX timestamp will be created.
+    :param ip_range: if a valid ip range, restricts the temporary URL to the
+        range of ips.
+    :param digest: digest algorithm to use. Must be one of ``sha1``,
+                   ``sha256``, or ``sha512``.
+    :raises ValueError: if timestamp or path is not in valid format,
+                        or if digest is not one of ``sha1``, ``sha256``, or
+                        ``sha512``.
+    :return: the path portion of a temporary URL
+    """
+    timestamp, absolute = parse_timestamp(seconds, absolute)
+
+    if isinstance(path, bytes):
         try:
             path_for_body = path.decode('utf-8')
         except UnicodeDecodeError:
             raise ValueError('path must be representable as UTF-8')
     else:
         path_for_body = path
+
+    if isinstance(digest, str) and digest in ('sha1', 'sha256', 'sha512'):
+        digest = getattr(hashlib, digest)
+    if digest not in (hashlib.sha1, hashlib.sha256, hashlib.sha512):
+        raise ValueError('digest must be one of sha1, sha256, or sha512')
 
     parts = path_for_body.split('/', 4)
     if len(parts) != 5 or parts[0] or not all(parts[1:(4 if prefix else 5)]):
@@ -155,24 +190,46 @@ def generate_temp_url(path, seconds, key, method, absolute=False,
         expiration = int(time.time() + timestamp)
     else:
         expiration = timestamp
-    hmac_body = u'\n'.join([method.upper(), str(expiration),
-                            ('prefix:' if prefix else '') + path_for_body])
+
+    hmac_parts = [method.upper(), str(expiration),
+                  ('prefix:' if prefix else '') + path_for_body]
+
+    if ip_range:
+        if isinstance(ip_range, bytes):
+            try:
+                ip_range = ip_range.decode('utf-8')
+            except UnicodeDecodeError:
+                raise ValueError(
+                    'ip_range must be representable as UTF-8'
+                )
+        hmac_parts.insert(0, "ip=%s" % ip_range)
+
+    hmac_body = '\n'.join(hmac_parts)
 
     # Encode to UTF-8 for py3 compatibility
-    if not isinstance(key, six.binary_type):
+    if not isinstance(key, bytes):
         key = key.encode('utf-8')
-    sig = hmac.new(key, hmac_body.encode('utf-8'), hashlib.sha1).hexdigest()
+    mac = hmac.new(key, hmac_body.encode('utf-8'), digest)
+    if digest == hashlib.sha512:
+        sig = 'sha512:' + base64.urlsafe_b64encode(
+            mac.digest()).decode('ascii').strip('=')
+    else:
+        sig = mac.hexdigest()
 
     if iso8601:
         expiration = time.strftime(
             EXPIRES_ISO8601_FORMAT, time.gmtime(expiration))
 
-    temp_url = u'{path}?temp_url_sig={sig}&temp_url_expires={exp}'.format(
+    temp_url = '{path}?temp_url_sig={sig}&temp_url_expires={exp}'.format(
         path=path_for_body, sig=sig, exp=expiration)
+
+    if ip_range:
+        temp_url += '&temp_url_ip_range={}'.format(ip_range)
+
     if prefix:
-        temp_url += u'&temp_url_prefix={}'.format(parts[4])
+        temp_url += '&temp_url_prefix={}'.format(parts[4])
     # Have return type match path from caller
-    if isinstance(path, six.binary_type):
+    if isinstance(path, bytes):
         return temp_url.encode('utf-8')
     else:
         return temp_url
@@ -180,7 +237,7 @@ def generate_temp_url(path, seconds, key, method, absolute=False,
 
 def get_body(headers, body):
     if headers.get('content-encoding') == 'gzip':
-        with gzip.GzipFile(fileobj=six.BytesIO(body), mode='r') as gz:
+        with gzip.GzipFile(fileobj=io.BytesIO(body), mode='r') as gz:
             nbody = gz.read()
         return nbody
     return body
@@ -199,10 +256,10 @@ def parse_api_response(headers, body):
 
 def split_request_headers(options, prefix=''):
     headers = {}
-    if isinstance(options, collections.Mapping):
+    if isinstance(options, Mapping):
         options = options.items()
     for item in options:
-        if isinstance(item, six.string_types):
+        if isinstance(item, str):
             if ':' not in item:
                 raise ValueError(
                     "Metadata parameter %s must contain a ':'.\n"
@@ -234,7 +291,7 @@ def report_traceback():
         return None, None
 
 
-class NoopMD5(object):
+class NoopMD5:
     def __init__(self, *a, **kw):
         pass
 
@@ -245,7 +302,7 @@ class NoopMD5(object):
         return ''
 
 
-class ReadableToIterable(object):
+class ReadableToIterable:
     """
     Wrap a filelike object and act as an iterator.
 
@@ -294,7 +351,7 @@ class ReadableToIterable(object):
         return self
 
 
-class LengthWrapper(object):
+class LengthWrapper:
     """
     Wrap a filelike object with a maximum length.
 
@@ -376,3 +433,31 @@ def n_at_a_time(seq, n):
 def n_groups(seq, n):
     items_per_group = ((len(seq) - 1) // n) + 1
     return n_at_a_time(seq, items_per_group)
+
+
+def normalize_manifest_path(path):
+    if path.startswith('/'):
+        return path[1:]
+    return path
+
+
+class JSONableIterable(list):
+    def __init__(self, iterable):
+        self._iterable = iter(iterable)
+        try:
+            self._peeked = next(self._iterable)
+            self._has_items = True
+        except StopIteration:
+            self._peeked = None
+            self._has_items = False
+
+    def __bool__(self):
+        return self._has_items
+
+    __nonzero__ = __bool__
+
+    def __iter__(self):
+        if self._has_items:
+            yield self._peeked
+        for item in self._iterable:
+            yield item

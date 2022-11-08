@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from six.moves import urllib
+import urllib
 
 
 class ClientException(Exception):
@@ -34,6 +34,13 @@ class ClientException(Exception):
         self.http_device = http_device
         self.http_response_content = http_response_content
         self.http_response_headers = http_response_headers
+
+        self.transaction_id = None
+        if self.http_response_headers:
+            for header in ('X-Trans-Id', 'X-Openstack-Request-Id'):
+                if header in self.http_response_headers:
+                    self.transaction_id = self.http_response_headers[header]
+                    break
 
     @classmethod
     def from_response(cls, resp, msg=None, body=None):
@@ -78,4 +85,7 @@ class ClientException(Exception):
             else:
                 b += '  [first 60 chars of response] %s' \
                     % self.http_response_content[:60]
-        return b and '%s: %s' % (a, b) or a
+        c = ''
+        if self.transaction_id:
+            c = ' (txn: %s)' % self.transaction_id
+        return b and '%s: %s%s' % (a, b, c) or (a + c)

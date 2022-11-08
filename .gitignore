@@ -7,6 +7,7 @@ dist/
 .DS_Store
 *.log
 .testrepository
+.stestr/
 subunit.log
 build
 swiftclient/versioninfo
@@ -16,3 +17,4 @@ cover/
 coverage.xml
 doc/build
 doc/source/api/
+.idea

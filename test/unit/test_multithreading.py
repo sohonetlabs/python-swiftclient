@@ -12,13 +12,13 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from queue import Queue, Empty
 import sys
 import unittest
 import threading
-import six
 
 from concurrent.futures import as_completed
-from six.moves.queue import Queue, Empty
 from time import sleep
 
 from swiftclient import multithreading as mt
@@ -37,7 +37,7 @@ class ThreadTestCase(unittest.TestCase):
         self.got_args_kwargs.put((args, kwargs))
 
         if item == 'sleep':
-            sleep(1)
+            sleep(.1)
         if item == 'go boom':
             raise Exception('I went boom!')
 
@@ -192,18 +192,18 @@ class TestOutputManager(unittest.TestCase):
             thread_manager.print_msg('one-argument')
             thread_manager.print_msg('one %s, %d fish', 'fish', 88)
             thread_manager.error('I have %d problems, but a %s is not one',
-                                 99, u'\u062A\u062A')
+                                 99, '\u062A\u062A')
             thread_manager.print_msg('some\n%s\nover the %r', 'where',
-                                     u'\u062A\u062A')
+                                     '\u062A\u062A')
             thread_manager.error('one-error-argument')
             thread_manager.error('Sometimes\n%.1f%% just\ndoes not\nwork!',
                                  3.14159)
             thread_manager.print_raw(
-                u'some raw bytes: \u062A\u062A'.encode('utf-8'))
+                'some raw bytes: \u062A\u062A'.encode('utf-8'))
 
             thread_manager.print_items([
                 ('key', 'value'),
-                ('object', u'O\u0308bject'),
+                ('object', 'O\u0308bject'),
             ])
 
             thread_manager.print_raw(b'\xffugly\xffraw')
@@ -216,23 +216,18 @@ class TestOutputManager(unittest.TestCase):
         # The threads should have been cleaned up
         self.assertEqual(starting_thread_count, threading.active_count())
 
-        if six.PY3:
-            over_the = "over the '\u062a\u062a'\n"
-        else:
-            over_the = "over the u'\\u062a\\u062a'\n"
-            # We write to the CaptureStream so no decoding is performed
         self.assertEqual(''.join([
             'one-argument\n',
             'one fish, 88 fish\n',
             'some\n', 'where\n',
-            over_the,
-            u'some raw bytes: \u062a\u062a',
+            "over the '\u062a\u062a'\n",
+            'some raw bytes: \u062a\u062a',
             '           key: value\n',
-            u'        object: O\u0308bject\n'
+            '        object: O\u0308bject\n'
         ]).encode('utf8') + b'\xffugly\xffraw', out_stream.getvalue())
 
         self.assertEqual(''.join([
-            u'I have 99 problems, but a \u062A\u062A is not one\n',
+            'I have 99 problems, but a \u062A\u062A is not one\n',
             'one-error-argument\n',
             'Sometimes\n', '3.1% just\n', 'does not\n', 'work!\n'
         ]), err_stream.getvalue().decode('utf8'))

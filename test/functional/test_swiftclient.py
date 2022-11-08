@@ -13,22 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import unittest
 import time
 from io import BytesIO
 
-from six.moves import configparser
-
 import swiftclient
+from . import TEST_CONFIG
 
 
 class TestFunctional(unittest.TestCase):
 
     def __init__(self, *args, **kwargs):
         super(TestFunctional, self).__init__(*args, **kwargs)
-        self.skip_tests = False
-        self._get_config()
+        self.skip_tests = (TEST_CONFIG is None)
+        if not self.skip_tests:
+            self._get_config()
 
         self.test_data = b'42' * 10
         self.etag = '2704306ec982238d85d4b235c925d58e'
@@ -40,36 +39,11 @@ class TestFunctional(unittest.TestCase):
         self.objectname_2 = self.objectname + '_second'
 
     def _get_config(self):
-        config_file = os.environ.get('SWIFT_TEST_CONFIG_FILE',
-                                     '/etc/swift/test.conf')
-        config = configparser.ConfigParser({'auth_version': '1'})
-        config.read(config_file)
-        self.config = config
-        if config.has_section('func_test'):
-            auth_host = config.get('func_test', 'auth_host')
-            auth_port = config.getint('func_test', 'auth_port')
-            auth_ssl = config.getboolean('func_test', 'auth_ssl')
-            auth_prefix = config.get('func_test', 'auth_prefix')
-            self.auth_version = config.get('func_test', 'auth_version')
-            try:
-                self.account_username = config.get('func_test',
-                                                   'account_username')
-            except configparser.NoOptionError:
-                account = config.get('func_test', 'account')
-                username = config.get('func_test', 'username')
-                self.account_username = "%s:%s" % (account, username)
-            self.password = config.get('func_test', 'password')
-            self.auth_url = ""
-            if auth_ssl:
-                self.auth_url += "https://"
-            else:
-                self.auth_url += "http://"
-            self.auth_url += "%s:%s%s" % (auth_host, auth_port, auth_prefix)
-            if self.auth_version == "1":
-                self.auth_url += 'v1.0'
-
-        else:
-            self.skip_tests = True
+        self.auth_url = TEST_CONFIG['auth_url']
+        self.cacert = TEST_CONFIG['cacert']
+        self.auth_version = TEST_CONFIG['auth_version']
+        self.account_username = TEST_CONFIG['account_username']
+        self.password = TEST_CONFIG['password']
 
     def _get_connection(self):
         """
@@ -77,7 +51,7 @@ class TestFunctional(unittest.TestCase):
         """
         return swiftclient.Connection(
             self.auth_url, self.account_username, self.password,
-            auth_version=self.auth_version)
+            auth_version=self.auth_version, cacert=self.cacert)
 
     def setUp(self):
         super(TestFunctional, self).setUp()
@@ -108,6 +82,7 @@ class TestFunctional(unittest.TestCase):
                 self.conn.delete_container(container)
             except swiftclient.ClientException:
                 pass
+        self.conn.close()
 
     def _check_account_headers(self, headers):
         headers_to_check = [
@@ -152,6 +127,18 @@ class TestFunctional(unittest.TestCase):
         headers, containers = self.conn.get_account(marker=self.containername)
         self.assertTrue(len(containers) >= 1)
         self.assertEqual(self.containername_2, containers[0].get('name'))
+
+        # Test prefix
+        _, containers = self.conn.get_account(prefix='dne')
+        self.assertEqual(0, len(containers))
+
+        # Test delimiter
+        _, containers = self.conn.get_account(
+            prefix=self.containername, delimiter='_')
+        self.assertEqual(2, len(containers))
+        self.assertEqual(self.containername, containers[0].get('name'))
+        self.assertTrue(
+            self.containername_2.startswith(containers[1].get('subdir')))
 
     def _check_container_headers(self, headers):
         self.assertTrue(headers.get('content-length'))
@@ -218,7 +205,7 @@ class TestFunctional(unittest.TestCase):
         hdrs = self.conn.head_object(self.containername, self.objectname)
         self.assertEqual(str(len(self.test_data)),
                          hdrs.get('content-length'))
-        self.assertEqual(self.etag, hdrs.get('etag'))
+        self.assertEqual(self.etag, hdrs.get('etag').strip('"'))
         self.assertEqual('application/octet-stream',
                          hdrs.get('content-type'))
 
@@ -229,7 +216,7 @@ class TestFunctional(unittest.TestCase):
         hdrs = self.conn.head_object(self.containername, self.objectname)
         self.assertEqual(str(len(self.test_data)),
                          hdrs.get('content-length'))
-        self.assertEqual(self.etag, hdrs.get('etag'))
+        self.assertEqual(self.etag, hdrs.get('etag').strip('"'))
         self.assertEqual('text/plain',
                          hdrs.get('content-type'))
 
@@ -240,7 +227,7 @@ class TestFunctional(unittest.TestCase):
         hdrs = self.conn.head_object(self.containername, self.objectname)
         self.assertEqual(str(len(self.test_data)),
                          hdrs.get('content-length'))
-        self.assertEqual(self.etag, hdrs.get('etag'))
+        self.assertEqual(self.etag, hdrs.get('etag').strip('"'))
         self.assertEqual('text/plain',
                          hdrs.get('content-type'))
 
@@ -252,7 +239,7 @@ class TestFunctional(unittest.TestCase):
         hdrs = self.conn.head_object(self.containername, self.objectname)
         self.assertEqual(str(len(self.test_data)),
                          hdrs.get('content-length'))
-        self.assertEqual(self.etag, hdrs.get('etag'))
+        self.assertEqual(self.etag, hdrs.get('etag').strip('"'))
         self.assertEqual('image/jpeg',
                          hdrs.get('content-type'))
 
@@ -263,7 +250,7 @@ class TestFunctional(unittest.TestCase):
         hdrs = self.conn.head_object(self.containername, self.objectname)
         self.assertEqual(str(len(self.test_data)),
                          hdrs.get('content-length'))
-        self.assertEqual(self.etag, hdrs.get('etag'))
+        self.assertEqual(self.etag, hdrs.get('etag').strip('"'))
         self.assertEqual('application/octet-stream', hdrs.get('content-type'))
 
         # Content from File-like object
@@ -273,7 +260,7 @@ class TestFunctional(unittest.TestCase):
         hdrs = self.conn.head_object(self.containername, self.objectname)
         self.assertEqual(str(len(self.test_data)),
                          hdrs.get('content-length'))
-        self.assertEqual(self.etag, hdrs.get('etag'))
+        self.assertEqual(self.etag, hdrs.get('etag').strip('"'))
         self.assertEqual('application/octet-stream', hdrs.get('content-type'))
 
         # Content from File-like object, but read in chunks
@@ -285,7 +272,7 @@ class TestFunctional(unittest.TestCase):
         hdrs = self.conn.head_object(self.containername, self.objectname)
         self.assertEqual(str(len(self.test_data)),
                          hdrs.get('content-length'))
-        self.assertEqual(self.etag, hdrs.get('etag'))
+        self.assertEqual(self.etag, hdrs.get('etag').strip('"'))
         self.assertEqual('application/octet-stream', hdrs.get('content-type'))
 
         # Wrong etag arg, should raise an exception
@@ -345,7 +332,7 @@ class TestFunctional(unittest.TestCase):
                                           resp_chunk_size=resp_chunk_size)
         data = next(body)
         self.assertEqual(self.test_data[:resp_chunk_size], data)
-        self.assertTrue(1, self.conn.attempts)
+        self.assertEqual(1, self.conn.attempts)
         for chunk in body.resp:
             # Flush remaining data from underlying response
             # (simulate a dropped connection)
@@ -382,13 +369,13 @@ class TestFunctional(unittest.TestCase):
         hdrs, body = self.conn.get_object(self.containername, self.objectname)
         data = body
         self.assertEqual(self.test_data, data)
-        self.assertTrue(1, self.conn.attempts)
+        self.assertEqual(1, self.conn.attempts)
 
         hdrs, body = self.conn.get_object(self.containername, self.objectname,
                                           resp_chunk_size=0)
         data = body
         self.assertEqual(self.test_data, data)
-        self.assertTrue(1, self.conn.attempts)
+        self.assertEqual(1, self.conn.attempts)
 
     def test_post_account(self):
         self.conn.post_account({'x-account-meta-data': 'Something'})
@@ -418,6 +405,16 @@ class TestFunctional(unittest.TestCase):
         self.assertEqual('123', headers.get('x-object-meta-int'))
         self.assertEqual('45.67', headers.get('x-object-meta-float'))
         self.assertEqual('False', headers.get('x-object-meta-bool'))
+
+    def test_post_object_unicode_header_name(self):
+        self.conn.post_object(self.containername,
+                              self.objectname,
+                              {'x-object-meta-\U0001f44d': '\U0001f44d'})
+
+        # Note that we can't actually read this header back on py3; see
+        # https://bugs.python.org/issue37093
+        # We'll have to settle for just testing that the POST doesn't blow up
+        # with a UnicodeDecodeError
 
     def test_copy_object(self):
         self.conn.put_object(
@@ -470,20 +467,20 @@ class TestUsingKeystone(TestFunctional):
     """
 
     def _get_connection(self):
-        account = username = password = None
+        account = username = None
         if self.auth_version not in ('2', '3'):
             self.skipTest('SKIPPING KEYSTONE-SPECIFIC FUNCTIONAL TESTS')
         try:
-            account = self.config.get('func_test', 'account')
-            username = self.config.get('func_test', 'username')
-            password = self.config.get('func_test', 'password')
-        except Exception:
+            account = TEST_CONFIG['account']
+            username = TEST_CONFIG['username']
+        except KeyError:
             self.skipTest('SKIPPING KEYSTONE-SPECIFIC FUNCTIONAL TESTS' +
                           ' - NO CONFIG')
-        os_options = {'tenant_name': account}
+
         return swiftclient.Connection(
-            self.auth_url, username, password, auth_version=self.auth_version,
-            os_options=os_options)
+            self.auth_url, username, self.password,
+            auth_version=self.auth_version, cacert=self.cacert,
+            os_options={'tenant_name': account})
 
 
 class TestUsingKeystoneV3(TestFunctional):
@@ -495,13 +492,14 @@ class TestUsingKeystoneV3(TestFunctional):
         account = username = password = project_domain = user_domain = None
         if self.auth_version != '3':
             self.skipTest('SKIPPING KEYSTONE-V3-SPECIFIC FUNCTIONAL TESTS')
+
         try:
-            account = self.config.get('func_test', 'account4')
-            username = self.config.get('func_test', 'username4')
-            user_domain = self.config.get('func_test', 'domain4')
-            project_domain = self.config.get('func_test', 'domain4')
-            password = self.config.get('func_test', 'password4')
-        except Exception:
+            account = TEST_CONFIG['account4']
+            username = TEST_CONFIG['username4']
+            user_domain = TEST_CONFIG['domain4']
+            project_domain = TEST_CONFIG['domain4']
+            password = TEST_CONFIG['password4']
+        except KeyError:
             self.skipTest('SKIPPING KEYSTONE-V3-SPECIFIC FUNCTIONAL TESTS' +
                           ' - NO CONFIG')
 
@@ -510,4 +508,5 @@ class TestUsingKeystoneV3(TestFunctional):
                       'user_domain_name': user_domain}
         return swiftclient.Connection(self.auth_url, username, password,
                                       auth_version=self.auth_version,
+                                      cacert=self.cacert,
                                       os_options=os_options)

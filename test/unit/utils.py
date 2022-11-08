@@ -12,16 +12,19 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import functools
+import io
+import importlib
+import os
 import sys
-from requests import RequestException
-from requests.structures import CaseInsensitiveDict
 from time import sleep
 import unittest
-import mock
-import six
-from six.moves import reload_module
-from six.moves.urllib.parse import urlparse, ParseResult
+from unittest import mock
+
+from requests import RequestException
+from requests.structures import CaseInsensitiveDict
+from urllib.parse import urlparse, ParseResult
 from swiftclient import client as c
 from swiftclient import shell as s
 from swiftclient.utils import EMPTY_ETAG
@@ -78,6 +81,10 @@ class StubResponse(object):
         self.body = body
         self.headers = headers or {}
 
+    def __repr__(self):
+        return '%s(%r, %r, %r)' % (self.__class__.__name__, self.status,
+                                   self.body, self.headers)
+
 
 def fake_http_connect(*code_iter, **kwargs):
     """
@@ -102,9 +109,9 @@ def fake_http_connect(*code_iter, **kwargs):
             self.etag = etag
             self.content = self.body = body
             self.timestamp = timestamp
-            self._is_closed = True
             self.headers = headers or {}
             self.request = None
+            self._closed = False
 
         def getresponse(self):
             if kwargs.get('raise_exc'):
@@ -162,6 +169,9 @@ def fake_http_connect(*code_iter, **kwargs):
         def getheader(self, name, default=None):
             return dict(self.getheaders()).get(name.lower(), default)
 
+        def close(self):
+            self._closed = True
+
     timestamps_iter = iter(kwargs.get('timestamps') or ['1'] * len(code_iter))
     etag_iter = iter(kwargs.get('etags') or [None] * len(code_iter))
     x = kwargs.get('missing_container', [False] * len(code_iter))
@@ -206,7 +216,19 @@ class MockHttpTest(unittest.TestCase):
         # won't cover the references to sys.stdout/sys.stderr in
         # swiftclient.multithreading
         self.capture_output = CaptureOutput()
-        self.capture_output.__enter__()
+        if 'SWIFTCLIENT_DEBUG' not in os.environ:
+            self.capture_output.__enter__()
+            self.addCleanup(self.capture_output.__exit__)
+
+            # since we're going to steal all stderr output globally; we should
+            # give the developer an escape hatch or risk scorn
+            def blowup_but_with_the_helpful(*args, **kwargs):
+                raise Exception(
+                    "You tried to enter a debugger while stderr is "
+                    "patched, you need to set SWIFTCLIENT_DEBUG=1 "
+                    "and try again")
+            import pdb
+            pdb.set_trace = blowup_but_with_the_helpful
 
         def fake_http_connection(*args, **kwargs):
             self.validateMockedRequestsConsumed()
@@ -228,7 +250,9 @@ class MockHttpTest(unittest.TestCase):
                 parsed, _conn = _orig_http_connection(url, proxy=proxy)
 
                 class RequestsWrapper(object):
-                    pass
+                    def close(self):
+                        if hasattr(self, 'resp'):
+                            self.resp.close()
                 conn = RequestsWrapper()
 
                 def request(method, path, *args, **kwargs):
@@ -384,8 +408,7 @@ class MockHttpTest(unittest.TestCase):
         # un-hygienic mocking on the swiftclient.client module; which may lead
         # to some unfortunate test order dependency bugs by way of the broken
         # window theory if any other modules are similarly patched
-        self.capture_output.__exit__()
-        reload_module(c)
+        importlib.reload(c)
 
 
 class CaptureStreamPrinter(object):
@@ -400,24 +423,20 @@ class CaptureStreamPrinter(object):
         # No encoding, just convert the raw bytes into a str for testing
         # The below call also validates that we have a byte string.
         self._captured_stream.write(
-            data if isinstance(data, six.binary_type) else data.encode('utf8'))
+            data if isinstance(data, bytes) else data.encode('utf8'))
 
 
 class CaptureStream(object):
 
     def __init__(self, stream):
         self.stream = stream
-        self._buffer = six.BytesIO()
+        self._buffer = io.BytesIO()
         self._capture = CaptureStreamPrinter(self._buffer)
         self.streams = [self._capture]
 
     @property
     def buffer(self):
-        if six.PY3:
-            return self._buffer
-        else:
-            raise AttributeError(
-                'Output stream has no attribute "buffer" in Python2')
+        return self._buffer
 
     def flush(self):
         pass
@@ -540,14 +559,6 @@ class FakeKeystone(object):
 
     class EndpointNotFound(Exception):
         pass
-
-
-def _make_fake_import_keystone_client(fake_import):
-    def _fake_import_keystone_client(auth_version):
-        fake_import.auth_version = auth_version
-        return fake_import, fake_import
-
-    return _fake_import_keystone_client
 
 
 class FakeStream(object):

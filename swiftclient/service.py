@@ -12,15 +12,16 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import unicode_literals
-import logging
 
+import logging
 import os
 
+from collections import defaultdict
 from concurrent.futures import as_completed, CancelledError, TimeoutError
 from copy import deepcopy
 from errno import EEXIST, ENOENT
 from hashlib import md5
+from io import StringIO
 from os import environ, makedirs, stat, utime
 from os.path import (
     basename, dirname, getmtime, getsize, isdir, join, sep as os_path_sep
@@ -29,10 +30,9 @@ from posixpath import join as urljoin
 from random import shuffle
 from time import time
 from threading import Thread
-from six import Iterator, StringIO, string_types, text_type
-from six.moves.queue import Queue
-from six.moves.queue import Empty as QueueEmpty
-from six.moves.urllib.parse import quote
+from queue import Queue
+from queue import Empty as QueueEmpty
+from urllib.parse import quote
 
 import json
 
@@ -44,7 +44,7 @@ from swiftclient.command_helpers import (
 from swiftclient.utils import (
     config_true_value, ReadableToIterable, LengthWrapper, EMPTY_ETAG,
     parse_api_response, report_traceback, n_groups, split_request_headers,
-    n_at_a_time
+    n_at_a_time, normalize_manifest_path
 )
 from swiftclient.exceptions import ClientException
 from swiftclient.multithreading import MultiThreadingManager
@@ -54,7 +54,7 @@ DISK_BUFFER = 2 ** 16
 logger = logging.getLogger("swiftclient.service")
 
 
-class ResultsIterator(Iterator):
+class ResultsIterator:
     def __init__(self, futures):
         self.futures = interruptable_as_completed(futures)
 
@@ -85,6 +85,9 @@ class SwiftError(Exception):
             value += " segment:%s" % self.segment
         return value
 
+    def __repr__(self):
+        return str(self)
+
 
 def process_options(options):
     # tolerate sloppy auth_version
@@ -105,6 +108,9 @@ def process_options(options):
             options['auth_version'] = '3'
         else:
             options['auth_version'] = '2.0'
+
+    if options.get('os_auth_type', None) == 'v3applicationcredential':
+        options['auth_version'] == '3'
 
     # Use new-style args if old ones not present
     if not options['auth'] and options['os_auth_url']:
@@ -130,6 +136,11 @@ def process_options(options):
         'auth_token': options['os_auth_token'],
         'object_storage_url': options['os_storage_url'],
         'region_name': options['os_region_name'],
+        'auth_type': options['os_auth_type'],
+        'application_credential_id':
+        options['os_application_credential_id'],
+        'application_credential_secret':
+        options['os_application_credential_secret'],
     }
 
 
@@ -144,6 +155,7 @@ def _build_default_global_options():
         "user": environ.get('ST_USER'),
         "key": environ.get('ST_KEY'),
         "retries": 5,
+        "retry_on_ratelimit": True,
         "force_auth_retry": False,
         "os_username": environ.get('OS_USERNAME'),
         "os_user_id": environ.get('OS_USER_ID'),
@@ -158,6 +170,11 @@ def _build_default_global_options():
         "os_project_domain_id": environ.get('OS_PROJECT_DOMAIN_ID'),
         "os_auth_url": environ.get('OS_AUTH_URL'),
         "os_auth_token": environ.get('OS_AUTH_TOKEN'),
+        "os_auth_type": environ.get('OS_AUTH_TYPE'),
+        "os_application_credential_id":
+        environ.get('OS_APPLICATION_CREDENTIAL_ID'),
+        "os_application_credential_secret":
+        environ.get('OS_APPLICATION_CREDENTIAL_SECRET'),
         "os_storage_url": environ.get('OS_STORAGE_URL'),
         "os_region_name": environ.get('OS_REGION_NAME'),
         "os_service_type": environ.get('OS_SERVICE_TYPE'),
@@ -173,6 +190,7 @@ def _build_default_global_options():
         'container_threads': 10
     }
 
+
 _default_global_options = _build_default_global_options()
 
 _default_local_options = {
@@ -184,6 +202,8 @@ _default_local_options = {
     'leave_segments': False,
     'changed': None,
     'skip_identical': False,
+    'skip_container_put': False,
+    'version_id': None,
     'yes_all': False,
     'read_acl': None,
     'write_acl': None,
@@ -198,6 +218,7 @@ _default_local_options = {
     'meta': [],
     'prefix': None,
     'delimiter': None,
+    'versions': False,
     'fail_fast': False,
     'human': False,
     'dir_marker': False,
@@ -251,10 +272,13 @@ def get_conn(options):
     """
     Return a connection building it from the options.
     """
+    options = dict(_default_global_options, **options)
     return Connection(options['auth'],
                       options['user'],
                       options['key'],
-                      options['retries'],
+                      timeout=options.get('timeout'),
+                      retry_on_ratelimit=options['retry_on_ratelimit'],
+                      retries=options['retries'],
                       auth_version=options['auth_version'],
                       os_options=options['os_options'],
                       snet=options['snet'],
@@ -263,7 +287,9 @@ def get_conn(options):
                       cert=options['os_cert'],
                       cert_key=options['os_key'],
                       ssl_compression=options['ssl_compression'],
-                      force_auth_retry=options['force_auth_retry'])
+                      force_auth_retry=options['force_auth_retry'],
+                      starting_backoff=options.get('starting_backoff', 1),
+                      max_backoff=options.get('max_backoff', 64))
 
 
 def mkdirs(path):
@@ -294,16 +320,16 @@ def split_headers(options, prefix=''):
     return headers
 
 
-class SwiftUploadObject(object):
+class SwiftUploadObject:
     """
     Class for specifying an object upload, allowing the object source, name and
     options to be specified separately for each individual object.
     """
     def __init__(self, source, object_name=None, options=None):
-        if isinstance(source, string_types):
+        if isinstance(source, str):
             self.object_name = object_name or source
         elif source is None or hasattr(source, 'read'):
-            if not object_name or not isinstance(object_name, string_types):
+            if not object_name or not isinstance(object_name, str):
                 raise SwiftError('Object names must be specified as '
                                  'strings for uploads from None or file '
                                  'like objects.')
@@ -320,13 +346,13 @@ class SwiftUploadObject(object):
         self.source = source
 
 
-class SwiftPostObject(object):
+class SwiftPostObject:
     """
     Class for specifying an object post, allowing the headers/metadata to be
     specified separately for each individual object.
     """
     def __init__(self, object_name, options=None):
-        if not (isinstance(object_name, string_types) and object_name):
+        if not (isinstance(object_name, str) and object_name):
             raise SwiftError(
                 "Object names must be specified as non-empty strings"
             )
@@ -334,7 +360,21 @@ class SwiftPostObject(object):
         self.options = options
 
 
-class SwiftCopyObject(object):
+class SwiftDeleteObject:
+    """
+    Class for specifying an object delete, allowing the headers/metadata to be
+    specified separately for each individual object.
+    """
+    def __init__(self, object_name, options=None):
+        if not (isinstance(object_name, str) and object_name):
+            raise SwiftError(
+                "Object names must be specified as non-empty strings"
+            )
+        self.object_name = object_name
+        self.options = options
+
+
+class SwiftCopyObject:
     """
     Class for specifying an object copy,
     allowing the destination/headers/metadata/fresh_metadata to be specified
@@ -342,7 +382,7 @@ class SwiftCopyObject(object):
     destination and fresh_metadata should be set in options
     """
     def __init__(self, object_name, options=None):
-        if not (isinstance(object_name, string_types) and object_name):
+        if not (isinstance(object_name, str) and object_name):
             raise SwiftError(
                 "Object names must be specified as non-empty strings"
             )
@@ -370,7 +410,7 @@ class SwiftCopyObject(object):
                 )
 
 
-class _SwiftReader(object):
+class _SwiftReader:
     """
     Class for downloading objects from swift and raising appropriate
     errors on failures caused by either invalid md5sum or size of the
@@ -424,8 +464,8 @@ class _SwiftReader(object):
                                  '{1} != {2}'.format(
                                      self._path, etag, self._expected_md5))
 
-        if (self._content_length is not None
-                and self._actual_read != self._content_length):
+        if (self._content_length is not None and
+                self._actual_read != self._content_length):
             raise SwiftError('Error downloading {0}: read_length != '
                              'content_length, {1:d} != {2:d}'.format(
                                  self._path, self._actual_read,
@@ -435,7 +475,7 @@ class _SwiftReader(object):
         return self._actual_read
 
 
-class SwiftService(object):
+class SwiftService:
     """
     Service for performing swift operations
     """
@@ -451,7 +491,9 @@ class SwiftService(object):
                 **_default_local_options
             )
         process_options(self._options)
-        create_connection = lambda: get_conn(self._options)
+
+        def create_connection():
+            return get_conn(self._options)
         self.thread_manager = MultiThreadingManager(
             create_connection,
             segment_threads=self._options['segment_threads'],
@@ -485,6 +527,7 @@ class SwiftService(object):
 
                             {
                                 'human': False,
+                                'version_id': None,
                                 'header': []
                             }
 
@@ -797,7 +840,7 @@ class SwiftService(object):
         post_objects = []
 
         for o in objects:
-            if isinstance(o, string_types):
+            if isinstance(o, str):
                 obj = SwiftPostObject(o)
                 post_objects.append(obj)
             elif isinstance(o, SwiftPostObject):
@@ -867,6 +910,7 @@ class SwiftService(object):
                                 'long': False,
                                 'prefix': None,
                                 'delimiter': None,
+                                'versions': False,
                                 'header': []
                             }
 
@@ -963,13 +1007,19 @@ class SwiftService(object):
     @staticmethod
     def _list_container_job(conn, container, options, result_queue):
         marker = options.get('marker', '')
+        version_marker = options.get('version_marker', '')
         error = None
         req_headers = split_headers(options.get('header', []))
+        if options.get('versions', False):
+            query_string = 'versions=true'
+        else:
+            query_string = None
         try:
             while True:
                 _, items = conn.get_container(
-                    container, marker=marker, prefix=options['prefix'],
-                    delimiter=options['delimiter'], headers=req_headers
+                    container, marker=marker, version_marker=version_marker,
+                    prefix=options['prefix'], delimiter=options['delimiter'],
+                    headers=req_headers, query_string=query_string
                 )
 
                 if not items:
@@ -987,10 +1037,11 @@ class SwiftService(object):
                 result_queue.put(res)
 
                 marker = items[-1].get('name', items[-1].get('subdir'))
+                version_marker = items[-1].get('version_id', '')
         except ClientException as err:
             traceback, err_time = report_traceback()
-            logger.exception(err)
             if err.http_status != 404:
+                logger.exception(err)
                 error = (err, traceback, err_time)
             else:
                 error = (
@@ -1012,6 +1063,7 @@ class SwiftService(object):
             'prefix': options['prefix'],
             'success': False,
             'marker': marker,
+            'version_marker': version_marker,
             'error': error[0],
             'traceback': error[1],
             'error_timestamp': error[2]
@@ -1038,6 +1090,7 @@ class SwiftService(object):
                                 'no_download': False,
                                 'header': [],
                                 'skip_identical': False,
+                                'version_id': None,
                                 'out_directory': None,
                                 'checksum': True,
                                 'out_file': None,
@@ -1147,6 +1200,9 @@ class SwiftService(object):
             get_args = {'resp_chunk_size': DISK_BUFFER,
                         'headers': req_headers,
                         'response_dict': results_dict}
+            if options.get('version_id') is not None:
+                get_args['query_string'] = (
+                    'version-id=%s' % options['version_id'])
             if options['skip_identical']:
                 # Assume the file is a large object; if we're wrong, the query
                 # string is ignored and the If-None-Match header will trigger
@@ -1244,8 +1300,8 @@ class SwiftService(object):
                 bytes_read = obj_body.bytes_read()
                 if fp is not None:
                     fp.close()
-                    if ('x-object-meta-mtime' in headers and not no_file
-                            and not options['ignore_mtime']):
+                    if ('x-object-meta-mtime' in headers and not no_file and
+                            not options['ignore_mtime']):
                         try:
                             mtime = float(headers['x-object-meta-mtime'])
                         except ValueError:
@@ -1410,6 +1466,7 @@ class SwiftService(object):
                                 'leave_segments': False,
                                 'changed': None,
                                 'skip_identical': False,
+                                'skip_container_put': False,
                                 'fail_fast': False,
                                 'dir_marker': False  # Only for None sources
                             }
@@ -1435,54 +1492,57 @@ class SwiftService(object):
         # the object name. (same as passing --object-name).
         container, _sep, pseudo_folder = container.partition('/')
 
-        # Try to create the container, just in case it doesn't exist. If this
-        # fails, it might just be because the user doesn't have container PUT
-        # permissions, so we'll ignore any error. If there's really a problem,
-        # it'll surface on the first object PUT.
-        policy_header = {}
-        _header = split_headers(options["header"])
-        if POLICY in _header:
-            policy_header[POLICY] = \
-                _header[POLICY]
-        create_containers = [
-            self.thread_manager.container_pool.submit(
-                self._create_container_job, container, headers=policy_header)
-        ]
+        if not options['skip_container_put']:
+            # Try to create the container, just in case it doesn't exist. If
+            # this fails, it might just be because the user doesn't have
+            # container PUT permissions, so we'll ignore any error. If there's
+            # really a problem, it'll surface on the first object PUT.
+            policy_header = {}
+            _header = split_headers(options["header"])
+            if POLICY in _header:
+                policy_header[POLICY] = \
+                    _header[POLICY]
+            create_containers = [
+                self.thread_manager.container_pool.submit(
+                    self._create_container_job, container,
+                    headers=policy_header)
+            ]
 
-        # wait for first container job to complete before possibly attempting
-        # segment container job because segment container job may attempt
-        # to HEAD the first container
-        for r in interruptable_as_completed(create_containers):
-            res = r.result()
-            yield res
+            # wait for first container job to complete before possibly
+            # attempting segment container job because segment container job
+            # may attempt to HEAD the first container
+            for r in interruptable_as_completed(create_containers):
+                res = r.result()
+                yield res
 
-        if segment_size:
-            seg_container = container + '_segments'
-            if options['segment_container']:
-                seg_container = options['segment_container']
-            if seg_container != container:
-                if not policy_header:
-                    # Since no storage policy was specified on the command
-                    # line, rather than just letting swift pick the default
-                    # storage policy, we'll try to create the segments
-                    # container with the same policy as the upload container
-                    create_containers = [
-                        self.thread_manager.container_pool.submit(
-                            self._create_container_job, seg_container,
-                            policy_source=container
-                        )
-                    ]
-                else:
-                    create_containers = [
-                        self.thread_manager.container_pool.submit(
-                            self._create_container_job, seg_container,
-                            headers=policy_header
-                        )
-                    ]
+            if segment_size:
+                seg_container = container + '_segments'
+                if options['segment_container']:
+                    seg_container = options['segment_container']
+                if seg_container != container:
+                    if not policy_header:
+                        # Since no storage policy was specified on the command
+                        # line, rather than just letting swift pick the default
+                        # storage policy, we'll try to create the segments
+                        # container with the same policy as the upload
+                        # container
+                        create_containers = [
+                            self.thread_manager.container_pool.submit(
+                                self._create_container_job, seg_container,
+                                policy_source=container
+                            )
+                        ]
+                    else:
+                        create_containers = [
+                            self.thread_manager.container_pool.submit(
+                                self._create_container_job, seg_container,
+                                headers=policy_header
+                            )
+                        ]
 
-                for r in interruptable_as_completed(create_containers):
-                    res = r.result()
-                    yield res
+                    for r in interruptable_as_completed(create_containers):
+                        res = r.result()
+                        yield res
 
         # We maintain a results queue here and a separate thread to monitor
         # the futures because we want to get results back from potential
@@ -1586,7 +1646,7 @@ class SwiftService(object):
         upload_objects = []
 
         for o in objects:
-            if isinstance(o, string_types):
+            if isinstance(o, str):
                 obj = SwiftUploadObject(o, urljoin(pseudo_folder,
                                                    o.lstrip('/')))
                 upload_objects.append(obj)
@@ -1982,11 +2042,6 @@ class SwiftService(object):
         if headers is None:
             headers = {}
         segment_results.sort(key=lambda di: di['segment_index'])
-        for seg in segment_results:
-            seg_loc = seg['segment_location'].lstrip('/')
-            if isinstance(seg_loc, text_type):
-                seg_loc = seg_loc.encode('utf-8')
-
         manifest_data = json.dumps([
             {
                 'path': d['segment_location'],
@@ -2036,8 +2091,8 @@ class SwiftService(object):
             new_slo_manifest_paths = set()
             segment_size = int(0 if options['segment_size'] is None
                                else options['segment_size'])
-            if (options['changed'] or options['skip_identical']
-                    or not options['leave_segments']):
+            if (options['changed'] or options['skip_identical'] or
+                    not options['leave_segments']):
                 try:
                     headers = conn.head_object(container, obj)
                     is_slo = config_true_value(
@@ -2058,22 +2113,21 @@ class SwiftService(object):
 
                     cl = int(headers.get('content-length'))
                     mt = headers.get('x-object-meta-mtime')
-                    if (path is not None and options['changed']
-                            and cl == getsize(path)
-                            and mt == put_headers['x-object-meta-mtime']):
+                    if (path is not None and options['changed'] and
+                            cl == getsize(path) and
+                            mt == put_headers['x-object-meta-mtime']):
                         res.update({
                             'success': True,
                             'status': 'skipped-changed'
                         })
                         return res
-                    if not options['leave_segments']:
+                    if not options['leave_segments'] and not headers.get(
+                            'content-location'):
                         old_manifest = headers.get('x-object-manifest')
                         if is_slo:
-                            for old_seg in chunk_data:
-                                seg_path = old_seg['name'].lstrip('/')
-                                if isinstance(seg_path, text_type):
-                                    seg_path = seg_path.encode('utf-8')
-                                old_slo_manifest_paths.append(seg_path)
+                            old_slo_manifest_paths.extend(
+                                normalize_manifest_path(old_seg['name'])
+                                for old_seg in chunk_data)
                 except ClientException as err:
                     if err.http_status != 404:
                         traceback, err_time = report_traceback()
@@ -2095,8 +2149,8 @@ class SwiftService(object):
             # a segment job if we're reading from a stream - we may fail if we
             # go over the single object limit, but this gives us a nice way
             # to create objects from memory
-            if (path is not None and segment_size
-                    and (getsize(path) > segment_size)):
+            if (path is not None and segment_size and
+                    (getsize(path) > segment_size)):
                 res['large_object'] = True
                 seg_container = container + '_segments'
                 if options['segment_container']:
@@ -2163,8 +2217,9 @@ class SwiftService(object):
                     response = self._upload_slo_manifest(
                         conn, segment_results, container, obj, put_headers)
                     res['manifest_response_dict'] = response
-                    new_slo_manifest_paths = {
-                        seg['segment_location'] for seg in segment_results}
+                    new_slo_manifest_paths.update(
+                        normalize_manifest_path(new_seg['segment_location'])
+                        for new_seg in segment_results)
                 else:
                     new_object_manifest = '%s/%s/%s/%s/%s/' % (
                         quote(seg_container.encode('utf8')),
@@ -2221,8 +2276,9 @@ class SwiftService(object):
                     response = self._upload_slo_manifest(
                         conn, results, container, obj, put_headers)
                     res['manifest_response_dict'] = response
-                    new_slo_manifest_paths = {
-                        r['segment_location'] for r in results}
+                    new_slo_manifest_paths.update(
+                        normalize_manifest_path(new_seg['segment_location'])
+                        for new_seg in results)
                     res['large_object'] = True
                 else:
                     res['response_dict'] = ret
@@ -2262,11 +2318,10 @@ class SwiftService(object):
                         fp.close()
             if old_manifest or old_slo_manifest_paths:
                 drs = []
-                delobjsmap = {}
+                delobjsmap = defaultdict(list)
                 if old_manifest:
                     scontainer, sprefix = old_manifest.split('/', 1)
                     sprefix = sprefix.rstrip('/') + '/'
-                    delobjsmap[scontainer] = []
                     for part in self.list(scontainer, {'prefix': sprefix}):
                         if not part["success"]:
                             raise part["error"]
@@ -2278,10 +2333,8 @@ class SwiftService(object):
                         if seg_to_delete in new_slo_manifest_paths:
                             continue
                         scont, sobj = \
-                            seg_to_delete.split(b'/', 1)
-                        delobjs_cont = delobjsmap.get(scont, [])
-                        delobjs_cont.append(sobj)
-                        delobjsmap[scont] = delobjs_cont
+                            seg_to_delete.split('/', 1)
+                        delobjsmap[scont].append(sobj)
 
                 del_segs = []
                 for dscont, dsobjs in delobjsmap.items():
@@ -2335,14 +2388,28 @@ class SwiftService(object):
         of objects.
 
         :param container: The container to delete or delete from.
-        :param objects: The list of objects to delete.
+        :param objects: A list of object names (strings) or SwiftDeleteObject
+                        instances containing an object name, and an
+                        options dict (can be None) to override the options for
+                        that individual delete operation::
+
+                            [
+                                'object_name',
+                                SwiftDeleteObject('object_name',
+                                                  options={...}),
+                                ...
+                            ]
+
+                        The options dict is described below.
         :param options: A dictionary containing options to override the global
                         options specified during the service object creation::
 
                             {
                                 'yes_all': False,
                                 'leave_segments': False,
+                                'version_id': None,
                                 'prefix': None,
+                                'versions': False,
                                 'header': [],
                             }
 
@@ -2362,23 +2429,28 @@ class SwiftService(object):
 
         if container is not None:
             if objects is not None:
+                delete_objects = self._make_delete_objects(objects)
                 if options['prefix']:
-                    objects = [obj for obj in objects
-                               if obj.startswith(options['prefix'])]
+                    delete_objects = [
+                        obj for obj in delete_objects
+                        if obj.object_name.startswith(options['prefix'])]
                 rq = Queue()
                 obj_dels = {}
 
-                bulk_page_size = self._bulk_delete_page_size(objects)
+                bulk_page_size = self._bulk_delete_page_size(delete_objects)
                 if bulk_page_size > 1:
-                    page_at_a_time = n_at_a_time(objects, bulk_page_size)
+                    page_at_a_time = n_at_a_time(delete_objects,
+                                                 bulk_page_size)
                     for page_slice in page_at_a_time:
                         for obj_slice in n_groups(
                                 page_slice,
                                 self._options['object_dd_threads']):
-                            self._bulk_delete(container, obj_slice, options,
+                            object_names = [
+                                obj.object_name for obj in obj_slice]
+                            self._bulk_delete(container, object_names, options,
                                               obj_dels)
                 else:
-                    self._per_item_delete(container, objects, options,
+                    self._per_item_delete(container, delete_objects, options,
                                           obj_dels, rq)
 
                 # Start a thread to watch for delete results
@@ -2425,8 +2497,8 @@ class SwiftService(object):
 
                             # Cancel the remaining container deletes, but yield
                             # any pending results
-                            if (not cancelled and options['fail_fast']
-                                    and not res['success']):
+                            if (not cancelled and options['fail_fast'] and
+                                    not res['success']):
                                 cancelled = True
 
     def _bulk_delete_page_size(self, objects):
@@ -2441,6 +2513,11 @@ class SwiftService(object):
         '''
         if len(objects) <= 2 * self._options['object_dd_threads']:
             # Not many objects; may as well delete one-by-one
+            return 1
+
+        if any(obj.options for obj in objects
+               if isinstance(obj, SwiftDeleteObject)):
+            # we can't do per option deletes for bulk
             return 1
 
         try:
@@ -2461,9 +2538,11 @@ class SwiftService(object):
             return 1
 
     def _per_item_delete(self, container, objects, options, rdict, rq):
-        for obj in objects:
+        for delete_obj in objects:
+            obj = delete_obj.object_name
+            obj_options = dict(options, **delete_obj.options or {})
             obj_del = self.thread_manager.object_dd_pool.submit(
-                self._delete_object, container, obj, options,
+                self._delete_object, container, obj, obj_options,
                 results_queue=rq
             )
             obj_details = {'container': container, 'object': obj}
@@ -2473,17 +2552,18 @@ class SwiftService(object):
     def _delete_segment(conn, container, obj, results_queue=None):
         results_dict = {}
         try:
-            conn.delete_object(container, obj, response_dict=results_dict)
             res = {'success': True}
+            conn.delete_object(container, obj, response_dict=results_dict)
         except Exception as err:
-            traceback, err_time = report_traceback()
-            logger.exception(err)
-            res = {
-                'success': False,
-                'error': err,
-                'traceback': traceback,
-                'error_timestamp': err_time
-            }
+            if not isinstance(err, ClientException) or err.http_status != 404:
+                traceback, err_time = report_traceback()
+                logger.exception(err)
+                res = {
+                    'success': False,
+                    'error': err,
+                    'traceback': traceback,
+                    'error_timestamp': err_time
+                }
 
         res.update({
             'action': 'delete_segment',
@@ -2497,6 +2577,24 @@ class SwiftService(object):
             results_queue.put(res)
         return res
 
+    @staticmethod
+    def _make_delete_objects(objects):
+        delete_objects = []
+
+        for o in objects:
+            if isinstance(o, str):
+                obj = SwiftDeleteObject(o)
+                delete_objects.append(obj)
+            elif isinstance(o, SwiftDeleteObject):
+                delete_objects.append(o)
+            else:
+                raise SwiftError(
+                    "The delete operation takes only strings or "
+                    "SwiftDeleteObjects as input",
+                    obj=o)
+
+        return delete_objects
+
     def _delete_object(self, conn, container, obj, options,
                        results_queue=None):
         _headers = {}
@@ -2508,19 +2606,24 @@ class SwiftService(object):
         }
         try:
             old_manifest = None
-            query_string = None
+            query_params = {}
 
             if not options['leave_segments']:
                 try:
                     headers = conn.head_object(container, obj,
-                                               headers=_headers)
+                                               headers=_headers,
+                                               query_string='symlink=get')
                     old_manifest = headers.get('x-object-manifest')
                     if config_true_value(headers.get('x-static-large-object')):
-                        query_string = 'multipart-manifest=delete'
+                        query_params['multipart-manifest'] = 'delete'
                 except ClientException as err:
                     if err.http_status != 404:
                         raise
 
+            if options.get('version_id') is not None:
+                query_params['version-id'] = options['version_id']
+            query_string = '&'.join('%s=%s' % (k, v) for (k, v)
+                                    in sorted(query_params.items()))
             results_dict = {}
             conn.delete_object(container, obj,
                                headers=_headers,
@@ -2607,12 +2710,17 @@ class SwiftService(object):
         try:
             for part in self.list(container=container, options=options):
                 if not part["success"]:
-
                     raise part["error"]
-
+                delete_objects = []
+                for item in part['listing']:
+                    delete_opts = {}
+                    if options.get('versions', False) and 'version_id' in item:
+                        delete_opts['version_id'] = item['version_id']
+                    delete_obj = SwiftDeleteObject(item['name'], delete_opts)
+                    delete_objects.append(delete_obj)
                 for res in self.delete(
                         container=container,
-                        objects=[o['name'] for o in part['listing']],
+                        objects=delete_objects,
                         options=options):
                     yield res
             if options['prefix']:
@@ -2675,7 +2783,9 @@ class SwiftService(object):
                         'No content received on account POST. '
                         'Is the bulk operations middleware enabled?')})
         except Exception as e:
-            res.update({'success': False, 'error': e})
+            traceback, err_time = report_traceback()
+            logger.exception(e)
+            res.update({'success': False, 'error': e, 'traceback': traceback})
 
         res.update({
             'action': 'bulk_delete',
@@ -2827,7 +2937,7 @@ class SwiftService(object):
         copy_objects = []
 
         for o in objects:
-            if isinstance(o, string_types):
+            if isinstance(o, str):
                 obj = SwiftCopyObject(o, options)
                 copy_objects.append(obj)
             elif isinstance(o, SwiftCopyObject):
